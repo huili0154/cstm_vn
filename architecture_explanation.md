@@ -1,6 +1,390 @@
-# VeighNa (vn.py) 核心模块与仿真回测复用指南
+# cstm_vn 项目架构分析文档
 
-为了实现高精度的“订单簿排队仿真 (Queue Simulation)”回测，我们将复用 VeighNa 的三个核心模块。以下是这些模块的关键概念和核心算法解析。
+> 基于 VeighNa (vnpy_evo) 的量化交易平台，集成桌面 GUI、Web 数据浏览器与订单簿排队仿真回测引擎。
+
+---
+
+## 目录
+
+1. [项目概述](#1-项目概述)
+2. [系统架构总览](#2-系统架构总览)
+3. [核心模块详解](#3-核心模块详解)
+4. [前端架构](#4-前端架构-react--electron)
+5. [数据流与存储设计](#5-数据流与存储设计)
+6. [脚本与入口点](#6-脚本与入口点)
+7. [外部依赖](#7-外部依赖)
+8. [VeighNa 核心模块复用指南](#8-veighna-核心模块复用指南)
+
+---
+
+## 1. 项目概述
+
+**名称**: cstm_vn (Customized VeighNa)
+**定位**: 面向 A 股与加密货币的量化交易平台
+
+**核心能力**:
+- 高精度回测引擎（订单簿排队仿真，非简单价格穿越）
+- 多源行情数据管理（TuShare、BaoStock、原始 CSV/7z）
+- 桌面 GUI 数据浏览器（PyQt5 + Electron/React 双栈）
+- 分布式批量回测（ProcessPoolExecutor 并行）
+
+---
+
+## 2. 系统架构总览
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   桌面应用 (Electron)                         │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │     React UI (DataBrowser + Workspace)                 │  │
+│  │  - DataBrowser: 数据集浏览与品种搜索                      │  │
+│  │  - Workspace:  SQL 查询、时序可视化                      │  │
+│  └────────────────────────────────────────────────────────┘  │
+│              IPC Bridge (preload.ts / contextBridge)          │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Electron Main Process                                 │  │
+│  │  - DuckDB 内存 SQL 引擎 → 直读 Parquet                  │  │
+│  │  - IPC Handlers: list / preview / query / series       │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+                            ↕
+┌──────────────────────────────────────────────────────────────┐
+│                   Python 后端                                │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ vnpy_evo/    │  │virtual_market│  │    tools/         │   │
+│  │ 交易引擎框架  │  │ 仿真回测引擎  │  │  数据管理工具集   │   │
+│  │ 事件驱动架构  │  │ 排队撮合策略  │  │  采集·清洗·编目   │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │           gui_viewer/ (PyQt5 数据浏览器)               │   │
+│  └──────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
+                            ↕
+┌──────────────────────────────────────────────────────────────┐
+│                    数据层 (文件系统)                           │
+│  dataset/                                                    │
+│  ├── meta/          instruments.json, dataset_manifest.json  │
+│  ├── ticks/         TS_CODE/YYYY-MM/YYYYMMDD.parquet        │
+│  └── daily/         TS_CODE/YYYY.parquet                    │
+│                                                              │
+│  rawData/           原始 CSV/7z 归档（不入 git）              │
+│  outputs/           回测日志与结果（不入 git）                 │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. 核心模块详解
+
+### 3.1 vnpy_evo/ — VeighNa 交易引擎框架
+
+**职责**: 提供事件驱动交易基础设施，包括行情网关、订单管理、日志、告警。
+
+| 子模块 | 说明 |
+|--------|------|
+| `trader/engine.py` | **MainEngine** (核心引擎)、**LogEngine** (loguru 日志)、**TelegramEngine** (告警推送) |
+| `trader/` | 网关集成、订单/成交处理、UI 组件 |
+| `event/` | EventEngine 事件总线 — 所有组件通过回调注册通信 |
+| `rpc/` | RpcServer / RpcClient — ZMQ 分布式交易 |
+| `rest/` | REST API 请求封装 |
+| `websocket/` | WebSocket 行情数据订阅客户端 |
+| `chart/` | K 线图表工具 |
+
+**设计模式**: 事件驱动 — 所有组件向 `EventEngine` 注册回调，通过事件类型解耦。
+
+```python
+# 核心引擎初始化流程
+MainEngine.__init__()
+  → EventEngine().start()
+  → LogEngine()          # loguru 替代默认日志
+  → OmsEngine()          # 订单管理系统
+  → EmailEngine()        # 邮件告警
+  → TelegramEngine()     # Telegram 推送
+```
+
+---
+
+### 3.2 virtual_market/ — 仿真回测引擎
+
+**职责**: 高保真订单撮合仿真，核心亮点是**订单簿排队模拟**（区别于传统价格穿越回测）。
+
+#### 数据模型 (`types.py`)
+
+```python
+@dataclass
+class Tick:       # 行情切片: bid/ask 价量、最新价、累计成交量
+class Order:      # 委托单: side, price, volume, queue_ahead, age_ticks
+class Trade:      # 成交记录: order_id, price, volume, timestamp
+class OrderStatus:  # SUBMITTED → PARTIAL → FILLED / CANCELLED
+class Side:       # BUY / SELL
+```
+
+#### 撮合引擎 (`engine.py` — MatchingEngine)
+
+```
+核心 API:
+  submit_limit_order(side, price, volume) → order_id
+  cancel_order(order_id)
+  process_tick(tick)  ← 每个行情切片驱动撮合
+
+排队仿真逻辑:
+  1. 挂单时记录当前 bid/ask 队列深度 → queue_ahead
+  2. 每个 tick 根据成交量变化递减 queue_ahead
+  3. queue_ahead ≤ 0 时触发成交
+  4. 回调: on_order() / on_trade() 通知策略
+```
+
+#### 策略 (`strategy.py` — LowBuyHighSellStrategy)
+
+| 参数 | 说明 |
+|------|------|
+| `order_size` | 单笔委托量 |
+| `lookback_ticks` | 回看窗口长度 |
+| `buy_buffer` | 买入缓冲系数 |
+| `sell_buffer` | 卖出缓冲系数 |
+| `cancel_after_ticks` | 超时撤单阈值 |
+
+**策略逻辑**:
+- 买入: price ≤ min(lookback) × (1 + buy_buffer)
+- 卖出: price ≥ max(lookback) × (1 - sell_buffer)
+- 超时自动撤单
+
+#### 回测执行 (`backtest.py` / `batch.py`)
+
+```
+单日回测 (run_backtest):
+  加载 parquet → MatchingEngine + Strategy → 逐 tick 处理
+  → 输出 events.jsonl, orders.jsonl, trades.jsonl, summary.json
+
+批量回测 (run_batch_backtest):
+  BatchTask(symbol, date) × N
+  → ProcessPoolExecutor 并行执行
+  → 汇总: 成交量、盈亏、耗时
+```
+
+---
+
+### 3.3 tools/ — 数据管理工具集
+
+**职责**: 多源数据采集、自动清洗、格式标准化、元数据编目。
+
+| 文件 | 功能 |
+|------|------|
+| `tick_parquet_manager.py` | 7z 压缩包解压 → 自动检测编码/分隔符 → Tick 数据转 Parquet |
+| `daily_parquet_manager.py` | CSV → 日线 OHLCV Parquet，列名标准化 |
+| `tushare_manager.py` | TuShare API 对接：日线下载、品种元数据同步 |
+| `dataset_updater.py` | 数据更新编排器：增量 / 全量模式 |
+| `manifest_manager.py` | 生成 `dataset_manifest.json` 数据目录 |
+| `rawdata_inspector.py` | 原始 CSV 智能探测：编码、分隔符、字段结构、数据质量校验 |
+| `universe.py` | 交易品种集定义 (symbols.txt → UniverseItem 列表) |
+
+**数据标准化规范**:
+- Tick: `dataset/ticks/{TS_CODE}/{YYYY-MM}/{YYYYMMDD}.parquet`
+- 日线: `dataset/daily/{TS_CODE}/{YYYY}.parquet`
+- 元数据: `dataset/meta/instruments.json`, `dataset_manifest.json`
+
+---
+
+### 3.4 gui_viewer/ — PyQt5 桌面数据浏览器
+
+**职责**: 独立运行的 Parquet 数据探索工具。
+
+| 文件 | 功能 |
+|------|------|
+| `main.py` | 入口: `python -m gui_viewer --dataset-root /path` |
+| `ui_main.py` | 主窗口: 左侧品种树 + 右侧数据表/图表 + 导入工具集成 |
+| `data_access.py` | Parquet I/O: `load_daily()`, `load_tick_day()`, 可用数据列表 |
+| `table_model.py` | `DataFrameTableModel` — PyQt5 TableView 的 pandas 适配器 |
+
+---
+
+## 4. 前端架构 (React + Electron)
+
+### 4.1 React UI (src/)
+
+```
+src/
+├── App.tsx              路由: "/" → DataBrowser, "/workspace" → Workspace
+├── main.tsx             React 入口
+├── pages/
+│   ├── DataBrowser.tsx  品种列表、搜索、预览 (前 120 行)
+│   └── Workspace.tsx    SQL 查询、分页表格、时序图表
+├── components/
+│   ├── AppShell.tsx     导航头部框架
+│   ├── DataTable.tsx    虚拟化数据表格
+│   ├── SeriesChart.tsx  Recharts 折线图
+│   └── WorkspaceSidebar.tsx  筛选条件构建器
+├── store/
+│   └── datasetStore.ts  Zustand 状态管理 (品种列表、选中项)
+├── hooks/
+│   └── useTheme.ts      暗色主题 hook
+└── utils/
+    └── columnGuess.ts   自动识别时间/数值列
+```
+
+**筛选操作符**: `eq`, `contains`, `gt`, `gte`, `lt`, `lte`, `between`, `is_null`, `not_null`
+
+### 4.2 Electron 主进程 (electron/src/)
+
+| 文件 | 职责 |
+|------|------|
+| `main.ts` | 窗口管理: dev 加载 `localhost:5173`，prod 加载打包产物 |
+| `preload.ts` | 安全 IPC 桥: `window.datasetApi` (contextBridge 隔离) |
+| `ipc.ts` | IPC 处理器: `datasets:list`, `dataset:preview`, `table:query`, `series:query` |
+| `duckdbClient.ts` | DuckDB 内存 SQL 引擎，直接 `read_parquet()` 查询 |
+| `queryBuilder.ts` | SQL 构建器 (参数化查询，防注入)，含降采样逻辑 |
+| `datasets.ts` | 数据集发现: 扫描目录 → DatasetNode 树 |
+| `paths.ts` | 路径安全: `safeResolveUnder()` 防路径穿越 |
+
+### 4.3 IPC 类型定义 (shared/ipc.ts)
+
+```typescript
+DataKind = "daily" | "tick"
+TableQuery  = { dataset, columns?, filters?, orderBy?, limit, offset }
+SeriesQuery = { dataset, xCol, yCol, filters, maxPoints }
+TableResult = { columns: Column[], rows: any[][], totalEstimate: number }
+```
+
+### 4.4 技术栈
+
+| 技术 | 版本 | 用途 |
+|------|------|------|
+| React | 18.3.1 | UI 框架 |
+| Vite | 6.3.5 | 构建 + HMR 开发服务器 |
+| Electron | 35.0.0 | 桌面宿主 |
+| DuckDB | 1.3.2 | 内存 SQL (Parquet 直查) |
+| Recharts | 2.15.1 | 图表渲染 |
+| Zustand | 5.0.3 | 状态管理 |
+| Tailwind CSS | 3.4.17 | 暗色主题样式 |
+
+---
+
+## 5. 数据流与存储设计
+
+### 5.1 数据采集管线
+
+```
+外部数据源 (TuShare / BaoStock / 原始 CSV)
+    ↓  download_baostock_*.py / tushare_manager.py
+rawData/  (原始归档，不入版本控制)
+    ↓  rawdata_inspector.py (自动探测编码/分隔符/结构)
+    ↓  tick_parquet_manager.py / daily_parquet_manager.py
+dataset/ticks/  和  dataset/daily/  (Parquet 列式存储)
+    ↓  manifest_manager.py
+dataset/meta/dataset_manifest.json  (数据目录)
+dataset/meta/instruments.json       (品种映射)
+```
+
+### 5.2 前端查询路径
+
+```
+React UI 操作 (筛选 / 翻页 / 选时序列)
+    ↓  ipcRenderer.invoke()
+Electron IPC Handler
+    ↓  queryBuilder.ts 生成 SQL
+DuckDB  SELECT ... FROM read_parquet('{path}') WHERE ... LIMIT ...
+    ↓  结果集
+React UI 渲染 (DataTable / SeriesChart)
+```
+
+### 5.3 回测数据路径
+
+```
+dataset/ticks/{SYMBOL}/{YYYY-MM}/{YYYYMMDD}.parquet
+    ↓  backtest.py 加载
+MatchingEngine + Strategy (逐 tick 仿真)
+    ↓  撮合事件流
+outputs/simulation_logs/
+├── {SYMBOL}_{DATE}_events.jsonl
+├── {SYMBOL}_{DATE}_orders.jsonl
+├── {SYMBOL}_{DATE}_trades.jsonl
+└── {SYMBOL}_{DATE}_summary.json
+```
+
+---
+
+## 6. 脚本与入口点
+
+### 回测脚本
+
+| 脚本 | 说明 |
+|------|------|
+| `run_virtual_market_simulation.py` | 单日仿真回测 (virtual_market 引擎) |
+| `run_virtual_market_batch.py` | 批量并行回测 (ProcessPoolExecutor) |
+| `run_simple_backtest.py` | VeighNa BacktestingEngine + DoubleMaStrategy (传统模式) |
+| `run_with_backtest.py` | 完整 VeighNa 桌面应用 (BinanceLinear 网关) |
+
+### 数据脚本
+
+| 脚本 | 说明 |
+|------|------|
+| `download_baostock_data.py` | BaoStock 数据下载 |
+| `download_baostock_*_5min.py` | 特定品种 5 分钟级数据下载 |
+| `import_baostock_*.py` | CSV 导入特定品种 |
+| `import_data.py` | 通用数据导入 |
+| `generate_mock_data.py` | 生成 1 分钟模拟 OHLCV 数据 |
+
+### GUI 启动
+
+```bash
+# PyQt5 数据浏览器
+python -m gui_viewer --dataset-root ./dataset
+
+# Electron 桌面应用 (开发模式)
+npm run dev
+
+# Electron 桌面应用 (生产构建)
+npm run build
+```
+
+### 示例程序 (examples/)
+
+| 目录 | 说明 |
+|------|------|
+| `examples/evo_trader/` | VeighNa UI + Binance 网关 + NovaStrategy |
+| `examples/simple_rpc/` | ZMQ 分布式交易 RPC 服务端/客户端 |
+| `examples/candle_chart/` | K 线图表示例 |
+
+---
+
+## 7. 外部依赖
+
+### Python
+
+| 包 | 用途 |
+|----|------|
+| vnpy | 交易框架核心 |
+| loguru | 结构化日志 |
+| pandas / numpy | 数据处理 |
+| pyarrow | Parquet I/O |
+| py7zr | 7z 解压 |
+| chardet | 编码检测 |
+| tushare | A 股行情 API |
+| baostock | A 股行情 API |
+| PySide6-Fluent-Widgets | Fluent UI 组件 |
+| PyQt5 | GUI 框架 |
+| websocket-client | WebSocket 连接 |
+
+### Node.js
+
+| 包 | 用途 |
+|----|------|
+| react / react-dom | UI 框架 |
+| electron | 桌面应用宿主 |
+| duckdb | 内存 SQL 引擎 |
+| recharts | 折线图 |
+| zustand | 状态管理 |
+| tailwindcss | 样式 |
+| lucide-react | 图标库 |
+| vite | 构建工具 |
+
+---
+
+## 8. VeighNa 核心模块复用指南
+
+> 以下为 VeighNa 核心模块在仿真回测中的复用说明。
 
 ## 1. 基础数据对象模块 (`vnpy.trader.object`)
 这是整个交易系统的“基石”，定义了所有标准化的数据结构。复用它意味着你的代码可以无缝对接 VeighNa 生态的所有组件（数据库、策略、UI）。
