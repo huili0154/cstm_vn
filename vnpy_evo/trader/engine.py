@@ -5,6 +5,8 @@ from queue import Queue, Empty
 import requests
 from loguru import logger
 
+from pathlib import Path
+from vnpy.trader.utility import get_folder_path
 from vnpy.trader.engine import (
     BaseEngine,
     EventEngine,
@@ -12,9 +14,7 @@ from vnpy.trader.engine import (
     OmsEngine,
     EmailEngine,
     Event,
-    EVENT_LOG,
-    Path,
-    get_folder_path
+    EVENT_LOG
 )
 
 from .object import LogData
