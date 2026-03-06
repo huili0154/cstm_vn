@@ -1,13 +1,10 @@
 [flake8]
-exclude = venv,build,__pycache__,__init__.py,ib,talib,uic
+exclude = venv,build,__pycache__,__init__.py
 ignore =
     # line too long, fixed by black
     E501,
     # line break before binary operator
     W503,
-per-file-ignores =
-    vnpy_evo\trader\app.py: F401, F403
-    vnpy_evo\trader\converter.py: F401, F403
     vnpy_evo\trader\constant.py: F401, F403
     vnpy_evo\trader\database.py: F401, F403
     vnpy_evo\trader\datafeed.py: F401, F403
