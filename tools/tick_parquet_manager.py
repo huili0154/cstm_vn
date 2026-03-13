@@ -4,6 +4,7 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -117,19 +118,15 @@ def _parse_datetime_series(day: pd.Series, t: pd.Series) -> pd.Series:
 
 
 def _infer_price_scale(df: pd.DataFrame) -> int:
+    """Raw CSV prices are in units of 1/10000 yuan. Always divide by 10000."""
     for col in ["申买价1", "申卖价1", "成交价", "开盘价", "前收盘"]:
         if col in df.columns:
             s = pd.to_numeric(df[col], errors="coerce")
             s = s[s > 0]
             if len(s) == 0:
                 continue
-            med = float(s.median())
-            if med > 10000:
-                return 10000
-            if med > 1000:
-                return 100
-            return 1
-    return 1
+            return 10000
+    return 10000
 
 
 def _symbol_dir_name(symbol: str) -> str:
@@ -296,6 +293,130 @@ def _write_parquet(df: pd.DataFrame, out_path: Path) -> None:
     pq.write_table(table, out_path, compression="zstd")
 
 
+def _process_single_archive(args: dict) -> dict:
+    """Process one 7z archive — designed to run in a child process.
+
+    *args* is a plain dict (pickle-safe) with keys:
+        archive_path, date, codes, instruments, root, tmp_dir
+
+    Returns a plain dict with per-archive results.
+    """
+    archive_path = Path(args["archive_path"])
+    date: str = args["date"]
+    codes: list[str] = args["codes"]
+    instruments: dict[str, dict] = args["instruments"]
+    root = Path(args["root"])
+    tmp_dir = Path(args["tmp_dir"])
+
+    result: dict = {
+        "date": date,
+        "written": 0,
+        "skipped": 0,
+        "missing_codes": [],
+        "entries": [],
+        "error": None,
+    }
+
+    if not archive_path.exists():
+        result["error"] = f"archive not found: {archive_path}"
+        return result
+
+    month = _month_key(date)
+
+    try:
+        # --- 1. Open 7z ONCE: scan targets + extract needed CSVs ---
+        with py7zr.SevenZipFile(archive_path, mode="r") as z:
+            names = set(z.getnames())
+
+            # Build targets (skip symbols whose parquet already exists)
+            targets: list[str] = []
+            for code in codes:
+                vendor_symbols: list[str] = []
+                meta = instruments.get(code) or {}
+                vs = meta.get("vendor_symbols")
+                if isinstance(vs, list) and vs:
+                    vendor_symbols = [str(x).upper() for x in vs]
+                if not vendor_symbols:
+                    vendor_symbols = [f"{code}.SZ", f"{code}.SH"]
+                for vsym in vendor_symbols:
+                    p = f"{date}/{vsym}/行情.csv"
+                    if p not in names:
+                        continue
+                    # Pre-check: skip if parquet already exists
+                    ts_code = (meta.get("ts_code") or vsym).upper()
+                    out_path = _tick_out_path(root, ts_code, month, date)
+                    if out_path.exists():
+                        result["skipped"] += 1
+                        continue
+                    targets.append(p)
+
+            found_codes = sorted({t.split("/")[1].split(".")[0] for t in targets if "/" in t})
+            result["missing_codes"] = sorted(set(codes) - set(found_codes))
+
+            if not targets:
+                return result
+
+            # Extract only needed CSVs in one shot
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            z.extract(path=tmp_dir, targets=targets)
+
+        # --- 2. Process each extracted CSV ---
+        for t in targets:
+            csv_path = tmp_dir / t
+            if not csv_path.exists():
+                continue
+
+            parts = t.replace("\\", "/").split("/")
+            if len(parts) < 3:
+                continue
+            vendor_sym = parts[1].upper()
+            code = vendor_sym.split(".")[0]
+            meta = instruments.get(code) or {}
+            ts_code = (meta.get("ts_code") or vendor_sym).upper()
+            name = meta.get("name")
+            out_path = _tick_out_path(root, ts_code, month, date)
+
+            # Double-check (another worker might have written it)
+            if out_path.exists():
+                result["skipped"] += 1
+                try:
+                    csv_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                continue
+
+            df_raw = _load_tick_csv(csv_path)
+            df, file_meta = _normalize_tick_df(df_raw)
+            _write_parquet(df, out_path)
+            result["written"] += 1
+
+            result["entries"].append({
+                "symbol": ts_code,
+                "code": code,
+                "name": name,
+                "vendor_symbol": vendor_sym,
+                "month": month,
+                "date": date,
+                "path": str(out_path.relative_to(root)).replace("\\", "/"),
+                "source_archive": str(archive_path.name),
+                "source_csv": t,
+                "rows": file_meta["rows"],
+                "start": file_meta["start"],
+                "end": file_meta["end"],
+                "price_scale": file_meta["price_scale"],
+            })
+
+            try:
+                csv_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 def import_from_raw(
     root: Path,
     rawdir: Path,
@@ -305,24 +426,29 @@ def import_from_raw(
     instruments_path: Path | None,
     logger: callable = print,
     progress_callback: callable = None,
+    archive_list: list[tuple[str, "Path"]] | None = None,
+    max_workers: int = 1,
 ) -> dict:
     codes = _read_universe_codes(universe_file)
     instruments = _load_instruments(instruments_path)
     manifest = load_manifest(root)
 
-    archives = []
-    if dates:
+    if archive_list:
+        archives = list(archive_list)
+    elif dates:
+        archives = []
         for d in dates:
             archives.append((d, rawdir / f"{d}.7z"))
     else:
+        archives = []
         for p in sorted(rawdir.glob("*.7z")):
             m = re.match(r"(\d{8})\.7z$", p.name)
             if m:
                 archives.append((m.group(1), p))
 
     total_archives = len(archives)
-    logger(f"Start Import: Found {total_archives} archives to process.")
-    
+    logger(f"Start Import: Found {total_archives} archives, workers={max_workers}")
+
     total_written = 0
     total_skipped = 0
     total_missing = 0
@@ -330,96 +456,100 @@ def import_from_raw(
 
     start_time = time.time()
 
-    for idx, (date, archive_path) in enumerate(archives, 1):
-        if progress_callback:
+    # Build serialisable arg dicts for each archive
+    task_args = []
+    for date, archive_path in archives:
+        task_args.append({
+            "archive_path": str(archive_path),
+            "date": date,
+            "codes": codes,
+            "instruments": instruments,
+            "root": str(root),
+            "tmp_dir": str(tmp_dir / date),  # per-date subdir avoids conflicts
+        })
+
+    def _handle_result(result: dict, idx: int) -> None:
+        nonlocal total_written, total_skipped, total_missing
+        date = result["date"]
+        total_written += result["written"]
+        total_skipped += result["skipped"]
+        missing_by_day[date] = result.get("missing_codes", [])
+
+        if result.get("error"):
+            logger(f"  [{date}] ERROR: {result['error']}")
+
+        if result["missing_codes"]:
+            preview = ",".join(result["missing_codes"][:6])
+            tail = "..." if len(result["missing_codes"]) > 6 else ""
+            logger(f"  [{date}] Missing symbols: {len(result['missing_codes'])} {preview}{tail}")
+
+        for entry in result.get("entries", []):
+            upsert_file_entry(
+                manifest.setdefault("tick", {}).setdefault("files", []),
+                entry,
+                keys=["symbol", "date"],
+            )
+
+        if not result.get("entries") and result["written"] == 0 and result["skipped"] == 0:
+            total_missing += 1
+
+        logger(f"  [{date}] Written={result['written']}, Skipped={result['skipped']}")
+
+    if max_workers <= 1:
+        # ── Serial mode (easy to debug, same behaviour as before) ──
+        for idx, args in enumerate(task_args, 1):
             elapsed = time.time() - start_time
             if idx > 1:
                 avg_time = elapsed / (idx - 1)
                 remaining = avg_time * (total_archives - idx + 1)
-                eta_str = f"{int(remaining // 60)}m {int(remaining % 60)}s"
+                eta_str = f"{int(remaining // 60)}m{int(remaining % 60):02d}s"
             else:
                 eta_str = "--:--"
-            progress_callback(idx, total_archives, f"Tick: {date} (ETA: {eta_str})")
+            if progress_callback:
+                progress_callback(idx, total_archives, f"Tick: {args['date']} (ETA: {eta_str})")
+            logger(f"[{idx}/{total_archives}] Processing {args['date']}...")
 
-        if not archive_path.exists():
-            continue
-        month = _month_key(date)
-        logger(f"[{idx}/{total_archives}] Processing {date} ({archive_path.name})...")
-        
-        targets = _extract_targets_from_archive(archive_path, date, codes, instruments)
-        found_codes = sorted({t.split("/")[1].split(".")[0] for t in targets if "/" in t})
-        missing_codes = sorted(set(codes) - set(found_codes))
-        missing_by_day[date] = missing_codes
-        
-        if missing_codes:
-            preview = ",".join(missing_codes[:6])
-            tail = "..." if len(missing_codes) > 6 else ""
-            logger(f"  - Missing symbols: {len(missing_codes)} {preview}{tail}")
-            
-        if not targets:
-            logger(f"  - No targets found for interested symbols.")
-            total_missing += 1
-            continue
+            result = _process_single_archive(args)
+            _handle_result(result, idx)
+    else:
+        # ── Parallel mode (ProcessPoolExecutor) ──
+        logger(f"启动 {max_workers} 个进程并行导入...")
+        completed_count = 0
+        # Map future → (idx, date) for progress tracking
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {}
+            for idx, args in enumerate(task_args, 1):
+                future = executor.submit(_process_single_archive, args)
+                future_map[future] = (idx, args["date"])
 
-        extracted = _extract_csvs(archive_path, tmp_dir, targets)
-        logger(f"  - Extracted {len(extracted)} CSVs.")
-        
-        day_written = 0
-        day_skipped = 0
-        
-        for csv_path in extracted:
-            rel = str(csv_path.relative_to(tmp_dir)).replace("\\", "/")
-            parts = rel.split("/")
-            if len(parts) < 3:
-                continue
-            vendor_sym = parts[1].upper()
-            code = vendor_sym.split(".")[0]
-            meta = instruments.get(code) or {}
-            ts_code = (meta.get("ts_code") or vendor_sym).upper()
-            name = meta.get("name")
-            out_path = _tick_out_path(root, ts_code, month, date)
-            if out_path.exists():
-                total_skipped += 1
-                day_skipped += 1
-                continue
+            for future in as_completed(future_map):
+                completed_count += 1
+                idx, date = future_map[future]
+                elapsed = time.time() - start_time
+                if completed_count > 0:
+                    avg_time = elapsed / completed_count
+                    remaining = avg_time * (total_archives - completed_count)
+                    eta_str = f"{int(remaining // 60)}m{int(remaining % 60):02d}s"
+                else:
+                    eta_str = "--:--"
 
-            df_raw = _load_tick_csv(csv_path)
-            df, meta = _normalize_tick_df(df_raw)
-            _write_parquet(df, out_path)
-            total_written += 1
-            day_written += 1
-            # verbose: print(f"[{date}] wrote: {ts_code} rows={meta['rows']} -> {out_path}")
+                if progress_callback:
+                    progress_callback(
+                        completed_count, total_archives,
+                        f"Tick: {date} (ETA: {eta_str}) [{completed_count}/{total_archives}]"
+                    )
+                try:
+                    result = future.result()
+                    _handle_result(result, idx)
+                except Exception as e:
+                    logger(f"  [{date}] Process error: {e}")
 
-            upsert_file_entry(
-                manifest.setdefault("tick", {}).setdefault("files", []),
-                {
-                    "symbol": ts_code,
-                    "code": code,
-                    "name": name,
-                    "vendor_symbol": vendor_sym,
-                    "month": month,
-                    "date": date,
-                    "path": str(out_path.relative_to(root)).replace("\\", "/"),
-                    "source_archive": str(archive_path.name),
-                    "source_csv": rel,
-                    "rows": meta["rows"],
-                    "start": meta["start"],
-                    "end": meta["end"],
-                    "price_scale": meta["price_scale"],
-                },
-                keys=["symbol", "date"],
-            )
-
-            try:
-                csv_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        
-        logger(f"  - Done {date}: Written {day_written}, Skipped {day_skipped}")
-        save_manifest(root, manifest)
+    # Save manifest once at the end
+    save_manifest(root, manifest)
 
     logger(
-        f"Import Finished: Written={total_written} Skipped={total_skipped} MissingDays={total_missing}"
+        f"Import Finished: Written={total_written} Skipped={total_skipped} "
+        f"MissingDays={total_missing} Workers={max_workers}"
     )
 
     return {
@@ -477,6 +607,7 @@ def main() -> None:
     p_import.add_argument("--dates", nargs="*")
     p_import.add_argument("--tmp-dir", default=str(Path(__file__).resolve().parents[1] / "rawData" / "_tmp_extract"))
     p_import.add_argument("--instruments", default=None)
+    p_import.add_argument("--workers", type=int, default=1, help="并行进程数 (1-10, 默认1=串行)")
 
     p_export = sub.add_parser("export")
     p_export.add_argument("--symbol", required=True)
@@ -496,6 +627,7 @@ def main() -> None:
             dates=args.dates,
             tmp_dir=Path(args.tmp_dir),
             instruments_path=Path(args.instruments) if args.instruments else None,
+            max_workers=max(1, min(10, args.workers)),
         )
     elif args.cmd == "export":
         export_csv(

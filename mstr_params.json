@@ -1,0 +1,36 @@
+{
+  "engine": {
+    "dataset_dir": "dataset",
+    "initial_capital": 50000.0,
+    "rate": 0.0001,
+    "slippage": 0.0,
+    "pricetick": 0.001,
+    "volume_limit_ratio": 1.0,
+    "credit_ratio": 0.5,
+    "enable_t0": true
+  },
+  "strategy": {
+    "symbols": [
+      "513500.SH",
+      "159655.SZ"
+    ],
+    "start_date": "20250601",
+    "end_date": "20251231",
+    "window": 10,
+    "k_threshold": 0.25,
+    "least_bias": 0.003,
+    "num_blocks": 3,
+    "sub_lots": 3,
+    "cooldown_1": 20,
+    "cooldown_2": 20,
+    "chase_wait_ticks": 2,
+    "block_timeout": 20,
+    "near_optimal_delta": 0.1,
+    "trading_cutoff_str": "14:50:00",
+    "max_positions": 2,
+    "max_single_weight": 1.0,
+    "min_cash_reserve": 100.0,
+    "enable_t0": true
+  },
+  "initial_positions": {}
+}

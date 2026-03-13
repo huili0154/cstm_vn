@@ -78,6 +78,10 @@ dataset/
 rawData/
 outputs/
 
+# Temporary analysis/diagnostic scripts
+_*.py
+_narrative_output.txt
+
 # mypy
 .mypy_cache/
 .dmypy.json

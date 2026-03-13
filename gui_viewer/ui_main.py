@@ -90,7 +90,10 @@ def _to_epoch_seconds(dt: pd.Series) -> np.ndarray:
     return (dt.astype("int64") // 10**9).to_numpy(dtype=np.int64)
 
 
+
 class ImportWorker(QThread):
+    """后台导入线程：递归搜索 7z 文件 → 导入 Tick → 下载日线。"""
+
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int, str)  # current, total, message
     finished_signal = pyqtSignal()
@@ -101,394 +104,100 @@ class ImportWorker(QThread):
         self.kwargs = kwargs
 
     def run(self):
+        import re as _re
+
         try:
             self.log_signal.emit("=== 任务开始 ===")
-            
-            # Unpack args
+
             raw_dir = self.kwargs['raw_dir']
             symbols_path = self.kwargs['symbols_path']
             d_start = self.kwargs['d_start']
             d_end = self.kwargs['d_end']
             project_root = self.kwargs['project_root']
             ds_root = self.kwargs['ds_root']
-            
-            # Step 1: Tick Import
-            self.log_signal.emit("正在执行：Tick数据导入...")
-            tmp_dir = raw_dir / "_tmp_extract_gui"
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                instruments_path = None
-                
-            def worker_logger(msg: str):
-                self.log_signal.emit(msg)
-            
-            def worker_progress(curr: int, total: int, msg: str):
-                self.progress_signal.emit(curr, total, msg)
 
-            tick_res = import_from_raw(
-                root=project_root,
-                rawdir=raw_dir,
-                universe_file=symbols_path,
-                dates=None,
-                tmp_dir=tmp_dir,
-                instruments_path=instruments_path,
-                logger=worker_logger,
-                progress_callback=worker_progress,
-            )
-            self.log_signal.emit(f"Tick导入完成: Written={tick_res.get('written', 0)}")
-            
-            # Step 2: Daily Download
-            self.log_signal.emit("正在执行：日线数据下载...")
-            
+            # ── Step 1: 递归搜索 7z 文件 ──
+            archives = []
+            for p in sorted(raw_dir.rglob("*.7z")):
+                m = _re.match(r"(\d{8})\.7z$", p.name)
+                if m:
+                    archives.append((m.group(1), p))
+
+            # ── 计算总任务数（7z 文件 + 日线年份）──
             years = set()
             curr = d_start
             while curr <= d_end:
                 years.add(curr.year())
                 curr = curr.addDays(365)
             years.add(d_end.year())
-            
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                 self.log_signal.emit("跳过日线下载：未找到 instruments.parquet")
+            total_tasks = len(archives) + len(years)
+            completed = 0
+
+            if not archives:
+                self.log_signal.emit("未找到任何 yyyymmdd.7z 文件，跳过Tick导入")
             else:
-                total_daily_files = 0
-                for y in sorted(years):
-                    self.log_signal.emit(f"正在下载年份: {y}")
-                    try:
-                        daily_files = fetch_daily_year(
-                            root=project_root, 
-                            instruments_parquet=instruments_path, 
-                            year=y,
-                            logger=worker_logger,
-                            progress_callback=worker_progress,
-                        )
-                        count = len(daily_files)
-                        total_daily_files += count
-                        self.log_signal.emit(f"年份 {y} 下载完成: {count} 文件")
-                    except Exception as e:
-                        self.log_signal.emit(f"年份 {y} 下载失败: {e}")
-                self.log_signal.emit(f"日线下载完成，共更新 {total_daily_files} 个文件")
-            
-            self.log_signal.emit("=== 任务结束 ===")
-            self.finished_signal.emit()
+                self.log_signal.emit(f"发现 {len(archives)} 个7z文件，开始导入Tick数据...")
 
-        except Exception as e:
-            self.error_signal.emit(str(e))
+                tmp_dir = raw_dir / "_tmp_extract_gui"
+                instruments_path = ds_root / "meta" / "instruments.parquet"
+                if not instruments_path.exists():
+                    instruments_path = None
 
+                def worker_logger(msg: str):
+                    self.log_signal.emit(msg)
 
-class ImportWorker(QThread):
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-    error_signal = pyqtSignal(str)
+                def worker_progress(curr_idx: int, total_archives: int, msg: str):
+                    nonlocal completed
+                    completed = curr_idx
+                    self.progress_signal.emit(completed, total_tasks, msg)
 
-    def __init__(self, parent=None, **kwargs):
-        super().__init__(parent)
-        self.kwargs = kwargs
+                tick_res = import_from_raw(
+                    root=project_root,
+                    rawdir=raw_dir,
+                    universe_file=symbols_path,
+                    dates=None,
+                    tmp_dir=tmp_dir,
+                    instruments_path=instruments_path,
+                    logger=worker_logger,
+                    progress_callback=worker_progress,
+                    archive_list=archives,
+                    max_workers=self.kwargs.get('max_workers', 1),
+                )
+                completed = len(archives)
+                self.progress_signal.emit(completed, total_tasks, "Tick导入完成")
+                self.log_signal.emit(
+                    f"Tick导入完成: Written={tick_res.get('written', 0)}, "
+                    f"Skipped={tick_res.get('skipped', 0)}"
+                )
 
-    def run(self):
-        try:
-            self.log_signal.emit("=== 任务开始 ===")
-            
-            # Unpack args
-            raw_dir = self.kwargs['raw_dir']
-            symbols_path = self.kwargs['symbols_path']
-            d_start = self.kwargs['d_start']
-            d_end = self.kwargs['d_end']
-            project_root = self.kwargs['project_root']
-            ds_root = self.kwargs['ds_root']
-            
-            # Step 1: Tick Import
-            self.log_signal.emit("正在执行：Tick数据导入...")
-            tmp_dir = raw_dir / "_tmp_extract_gui"
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                instruments_path = None
-                
-            def worker_logger(msg: str):
-                self.log_signal.emit(msg)
-
-            tick_res = import_from_raw(
-                root=project_root,
-                rawdir=raw_dir,
-                universe_file=symbols_path,
-                dates=None,
-                tmp_dir=tmp_dir,
-                instruments_path=instruments_path,
-                logger=worker_logger,
-            )
-            self.log_signal.emit(f"Tick导入完成: Written={tick_res.get('written', 0)}")
-            
-            # Step 2: Daily Download
+            # ── Step 2: 日线下载 ──
             self.log_signal.emit("正在执行：日线数据下载...")
-            
-            years = set()
-            curr = d_start
-            while curr <= d_end:
-                years.add(curr.year())
-                curr = curr.addDays(365)
-            years.add(d_end.year())
-            
+
             instruments_path = ds_root / "meta" / "instruments.parquet"
             if not instruments_path.exists():
-                 self.log_signal.emit("跳过日线下载：未找到 instruments.parquet")
+                self.log_signal.emit("跳过日线下载：未找到 instruments.parquet")
+                completed = total_tasks
+                self.progress_signal.emit(completed, total_tasks, "完成")
             else:
                 total_daily_files = 0
                 for y in sorted(years):
                     self.log_signal.emit(f"正在下载年份: {y}")
                     try:
                         daily_files = fetch_daily_year(
-                            root=project_root, 
-                            instruments_parquet=instruments_path, 
+                            root=project_root,
+                            instruments_parquet=instruments_path,
                             year=y,
-                            logger=worker_logger
+                            logger=lambda msg: self.log_signal.emit(msg),
                         )
                         count = len(daily_files)
                         total_daily_files += count
                         self.log_signal.emit(f"年份 {y} 下载完成: {count} 文件")
                     except Exception as e:
                         self.log_signal.emit(f"年份 {y} 下载失败: {e}")
+                    completed += 1
+                    self.progress_signal.emit(completed, total_tasks, f"日线 {y}")
                 self.log_signal.emit(f"日线下载完成，共更新 {total_daily_files} 个文件")
-            
-            self.log_signal.emit("=== 任务结束 ===")
-            self.finished_signal.emit()
 
-        except Exception as e:
-            self.error_signal.emit(str(e))
-
-
-class ImportWorker(QThread):
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, parent=None, **kwargs):
-        super().__init__(parent)
-        self.kwargs = kwargs
-
-    def run(self):
-        try:
-            self.log_signal.emit("=== 任务开始 ===")
-            
-            # Unpack args
-            raw_dir = self.kwargs['raw_dir']
-            symbols_path = self.kwargs['symbols_path']
-            d_start = self.kwargs['d_start']
-            d_end = self.kwargs['d_end']
-            project_root = self.kwargs['project_root']
-            ds_root = self.kwargs['ds_root']
-            
-            # Step 1: Tick Import
-            self.log_signal.emit("正在执行：Tick数据导入...")
-            tmp_dir = raw_dir / "_tmp_extract_gui"
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                instruments_path = None
-                
-            def worker_logger(msg: str):
-                self.log_signal.emit(msg)
-
-            tick_res = import_from_raw(
-                root=project_root,
-                rawdir=raw_dir,
-                universe_file=symbols_path,
-                dates=None,
-                tmp_dir=tmp_dir,
-                instruments_path=instruments_path,
-                logger=worker_logger,
-            )
-            self.log_signal.emit(f"Tick导入完成: Written={tick_res.get('written', 0)}")
-            
-            # Step 2: Daily Download
-            self.log_signal.emit("正在执行：日线数据下载...")
-            
-            years = set()
-            curr = d_start
-            while curr <= d_end:
-                years.add(curr.year())
-                curr = curr.addDays(365)
-            years.add(d_end.year())
-            
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                 self.log_signal.emit("跳过日线下载：未找到 instruments.parquet")
-            else:
-                total_daily_files = 0
-                for y in sorted(years):
-                    self.log_signal.emit(f"正在下载年份: {y}")
-                    try:
-                        daily_files = fetch_daily_year(
-                            root=project_root, 
-                            instruments_parquet=instruments_path, 
-                            year=y,
-                            logger=worker_logger
-                        )
-                        count = len(daily_files)
-                        total_daily_files += count
-                        self.log_signal.emit(f"年份 {y} 下载完成: {count} 文件")
-                    except Exception as e:
-                        self.log_signal.emit(f"年份 {y} 下载失败: {e}")
-                self.log_signal.emit(f"日线下载完成，共更新 {total_daily_files} 个文件")
-            
-            self.log_signal.emit("=== 任务结束 ===")
-            self.finished_signal.emit()
-
-        except Exception as e:
-            self.error_signal.emit(str(e))
-
-
-class ImportWorker(QThread):
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, parent=None, **kwargs):
-        super().__init__(parent)
-        self.kwargs = kwargs
-
-    def run(self):
-        try:
-            self.log_signal.emit("=== 任务开始 ===")
-            
-            # Unpack args
-            raw_dir = self.kwargs['raw_dir']
-            symbols_path = self.kwargs['symbols_path']
-            d_start = self.kwargs['d_start']
-            d_end = self.kwargs['d_end']
-            project_root = self.kwargs['project_root']
-            ds_root = self.kwargs['ds_root']
-            
-            # Step 1: Tick Import
-            self.log_signal.emit("正在执行：Tick数据导入...")
-            tmp_dir = raw_dir / "_tmp_extract_gui"
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                instruments_path = None
-                
-            def worker_logger(msg: str):
-                self.log_signal.emit(msg)
-
-            tick_res = import_from_raw(
-                root=project_root,
-                rawdir=raw_dir,
-                universe_file=symbols_path,
-                dates=None,
-                tmp_dir=tmp_dir,
-                instruments_path=instruments_path,
-                logger=worker_logger,
-            )
-            self.log_signal.emit(f"Tick导入完成: Written={tick_res.get('written', 0)}")
-            
-            # Step 2: Daily Download
-            self.log_signal.emit("正在执行：日线数据下载...")
-            
-            years = set()
-            curr = d_start
-            while curr <= d_end:
-                years.add(curr.year())
-                curr = curr.addDays(365)
-            years.add(d_end.year())
-            
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                 self.log_signal.emit("跳过日线下载：未找到 instruments.parquet")
-            else:
-                total_daily_files = 0
-                for y in sorted(years):
-                    self.log_signal.emit(f"正在下载年份: {y}")
-                    try:
-                        daily_files = fetch_daily_year(
-                            root=project_root, 
-                            instruments_parquet=instruments_path, 
-                            year=y,
-                            logger=worker_logger
-                        )
-                        count = len(daily_files)
-                        total_daily_files += count
-                        self.log_signal.emit(f"年份 {y} 下载完成: {count} 文件")
-                    except Exception as e:
-                        self.log_signal.emit(f"年份 {y} 下载失败: {e}")
-                self.log_signal.emit(f"日线下载完成，共更新 {total_daily_files} 个文件")
-            
-            self.log_signal.emit("=== 任务结束 ===")
-            self.finished_signal.emit()
-
-        except Exception as e:
-            self.error_signal.emit(str(e))
-
-
-class ImportWorker(QThread):
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, parent=None, **kwargs):
-        super().__init__(parent)
-        self.kwargs = kwargs
-
-    def run(self):
-        try:
-            self.log_signal.emit("=== 任务开始 ===")
-            
-            # Unpack args
-            raw_dir = self.kwargs['raw_dir']
-            symbols_path = self.kwargs['symbols_path']
-            d_start = self.kwargs['d_start']
-            d_end = self.kwargs['d_end']
-            project_root = self.kwargs['project_root']
-            ds_root = self.kwargs['ds_root']
-            
-            # Step 1: Tick Import
-            self.log_signal.emit("正在执行：Tick数据导入...")
-            tmp_dir = raw_dir / "_tmp_extract_gui"
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                instruments_path = None
-                
-            def worker_logger(msg: str):
-                self.log_signal.emit(msg)
-
-            tick_res = import_from_raw(
-                root=project_root,
-                rawdir=raw_dir,
-                universe_file=symbols_path,
-                dates=None,
-                tmp_dir=tmp_dir,
-                instruments_path=instruments_path,
-                logger=worker_logger,
-            )
-            self.log_signal.emit(f"Tick导入完成: Written={tick_res.get('written', 0)}")
-            
-            # Step 2: Daily Download
-            self.log_signal.emit("正在执行：日线数据下载...")
-            
-            years = set()
-            curr = d_start
-            while curr <= d_end:
-                years.add(curr.year())
-                curr = curr.addDays(365)
-            years.add(d_end.year())
-            
-            instruments_path = ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                 self.log_signal.emit("跳过日线下载：未找到 instruments.parquet")
-            else:
-                total_daily_files = 0
-                for y in sorted(years):
-                    self.log_signal.emit(f"正在下载年份: {y}")
-                    try:
-                        daily_files = fetch_daily_year(
-                            root=project_root, 
-                            instruments_parquet=instruments_path, 
-                            year=y,
-                            logger=worker_logger
-                        )
-                        count = len(daily_files)
-                        total_daily_files += count
-                        self.log_signal.emit(f"年份 {y} 下载完成: {count} 文件")
-                    except Exception as e:
-                        self.log_signal.emit(f"年份 {y} 下载失败: {e}")
-                self.log_signal.emit(f"日线下载完成，共更新 {total_daily_files} 个文件")
-            
             self.log_signal.emit("=== 任务结束 ===")
             self.finished_signal.emit()
 
@@ -610,7 +319,18 @@ class MainWindow(QMainWindow):
         row_clear.addWidget(self.btn_clear_ticks)
         data_layout.addLayout(row_clear)
 
-        # 5. Start Import & Progress
+        # 5. Parallel Workers
+        row_workers = QHBoxLayout()
+        row_workers.addWidget(QLabel("并行进程数:"))
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(1, 10)
+        self.spin_workers.setValue(4)
+        self.spin_workers.setToolTip("导入 Tick 数据时使用的并行进程数（1=串行）")
+        row_workers.addWidget(self.spin_workers)
+        row_workers.addStretch()
+        data_layout.addLayout(row_workers)
+
+        # 6. Start Import & Progress
         self.btn_start_import = QPushButton("开始导入 / 下载")
         self.btn_start_import.setFixedHeight(36)
         self.btn_start_import.setStyleSheet("font-weight: bold; background-color: #e0e0e0;")
@@ -906,6 +626,10 @@ class MainWindow(QMainWindow):
         if d_end_str:
             self.date_daily_end.setDate(QDate.fromString(d_end_str, "yyyy-MM-dd"))
 
+        # Restore parallel workers
+        last_workers = self.settings.value("import/workers", 4, type=int)
+        self.spin_workers.setValue(max(1, min(10, last_workers)))
+
         if not self.instruments:
             QMessageBox.critical(self, "错误", "未找到 instruments.parquet")
             return
@@ -1040,7 +764,7 @@ class MainWindow(QMainWindow):
         # 1. Gather Inputs
         symbols_path_str = self.edit_symbols_path.text().strip()
         raw_dir_str = self.edit_raw_dir.text().strip()
-        
+
         if not symbols_path_str or not Path(symbols_path_str).exists():
             QMessageBox.warning(self, "参数错误", "请指定有效的证券列表文件 (symbols.txt)")
             return
@@ -1050,112 +774,82 @@ class MainWindow(QMainWindow):
 
         symbols_path = Path(symbols_path_str)
         raw_dir = Path(raw_dir_str)
-        
+
         # Save inputs to settings
         self.settings.setValue("import/symbols_path", symbols_path_str)
         self.settings.setValue("import/raw_dir", raw_dir_str)
-        
+
         # Date Range for Daily
         d_start = self.date_daily_start.date()
         d_end = self.date_daily_end.date()
         if d_start > d_end:
             d_start, d_end = d_end, d_start
-        
+
         # Save dates to settings
         self.settings.setValue("import/daily_start", d_start.toString("yyyy-MM-dd"))
         self.settings.setValue("import/daily_end", d_end.toString("yyyy-MM-dd"))
-        
+        self.settings.setValue("import/workers", self.spin_workers.value())
+
         # Confirm
+        workers = self.spin_workers.value()
         msg = (
             f"准备开始数据导入任务：\n\n"
-            f"1. 导入Tick数据 (Source: {raw_dir.name})\n"
+            f"1. 导入Tick数据 (Source: {raw_dir.name} 及子目录, 并行进程: {workers})\n"
             f"2. 下载日线数据 ({d_start.toString('yyyy-MM-dd')} - {d_end.toString('yyyy-MM-dd')})\n\n"
-            "任务可能耗时较长，请保持程序运行。\n是否开始？"
+            "任务将在后台执行，不会冻结界面。\n是否开始？"
         )
         if QMessageBox.question(self, "开始任务", msg, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
 
-        self.setCursor(Qt.WaitCursor)
         self.btn_start_import.setEnabled(False)
-        self._append_message("=== 任务开始 ===")
-        
-        try:
-            # Step 1: Tick Import
-            self._append_message("正在执行：Tick数据导入...")
-            QApplication.processEvents()
-            
-            project_root = self._project_root()
-            tmp_dir = raw_dir / "_tmp_extract_gui"
-            instruments_path = self.ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                instruments_path = None
-            
-            # Use direct callback to append messages and process events immediately
-            def tick_logger(msg: str):
-                self._append_message(msg)
-                QApplication.processEvents()
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0/0 (0%)")
+        self.lbl_eta.setVisible(True)
+        self.lbl_eta.setText("准备中...")
+        self._append_message("=== 任务开始（后台）===")
 
-            tick_res = import_from_raw(
-                root=project_root,
-                rawdir=raw_dir,
-                universe_file=symbols_path,
-                dates=None,
-                tmp_dir=tmp_dir,
-                instruments_path=instruments_path,
-                logger=tick_logger,
-            )
-            
-            self._append_message(f"Tick导入完成: Written={tick_res.get('written', 0)}")
+        project_root = self._project_root()
 
-            # Step 2: Daily Download
-            self._append_message("正在执行：日线数据下载...")
-            QApplication.processEvents()
-            
-            years = set()
-            curr = d_start
-            while curr <= d_end:
-                years.add(curr.year())
-                curr = curr.addDays(365)
-            years.add(d_end.year())
-            
-            instruments_path = self.ds_root / "meta" / "instruments.parquet"
-            if not instruments_path.exists():
-                 self._append_message("跳过日线下载：未找到 instruments.parquet")
-            else:
-                total_daily_files = 0
-                
-                def daily_logger(msg: str):
-                    self._append_message(msg)
-                    QApplication.processEvents()
+        self._import_worker = ImportWorker(
+            self,
+            raw_dir=raw_dir,
+            symbols_path=symbols_path,
+            d_start=d_start,
+            d_end=d_end,
+            project_root=project_root,
+            ds_root=self.ds_root,
+            max_workers=self.spin_workers.value(),
+        )
+        self._import_worker.log_signal.connect(self._append_message)
+        self._import_worker.progress_signal.connect(self._on_import_progress)
+        self._import_worker.finished_signal.connect(self._on_import_finished)
+        self._import_worker.error_signal.connect(self._on_import_error)
+        self._import_worker.start()
 
-                for y in sorted(years):
-                    self._append_message(f"正在下载年份: {y}")
-                    QApplication.processEvents()
-                    try:
-                        daily_files = fetch_daily_year(
-                            root=project_root, 
-                            instruments_parquet=instruments_path, 
-                            year=y,
-                            logger=daily_logger
-                        )
-                        count = len(daily_files)
-                        total_daily_files += count
-                        self._append_message(f"年份 {y} 下载完成: {count} 文件")
-                    except Exception as e:
-                        self._append_message(f"年份 {y} 下载失败: {e}")
-                    QApplication.processEvents()
-                self._append_message(f"日线下载完成，共更新 {total_daily_files} 个文件")
+    def _on_import_progress(self, current: int, total: int, message: str) -> None:
+        if total > 0:
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(current)
+            pct = int(current * 100 / total)
+            self.progress_bar.setFormat(f"{current}/{total} ({pct}%)")
+            self.lbl_eta.setText(message)
 
-        except Exception as e:
-            QMessageBox.critical(self, "任务出错", str(e))
-            self._append_message(f"任务异常终止: {e}")
-        finally:
-            self.unsetCursor()
-            self.btn_start_import.setEnabled(True)
-            self._append_message("=== 任务结束 ===")
-            self._reload_symbol_dependent()
-            self._refresh_table()
-            self._refresh_chart()
+    def _on_import_finished(self) -> None:
+        self.btn_start_import.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_eta.setVisible(False)
+        self._append_message("=== 后台任务完成 ===")
+        self._reload_symbol_dependent()
+        self._refresh_table()
+        self._refresh_chart()
+
+    def _on_import_error(self, error_msg: str) -> None:
+        self.btn_start_import.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_eta.setVisible(False)
+        self._append_message(f"任务异常终止: {error_msg}")
+        QMessageBox.critical(self, "任务出错", error_msg)
 
     def _on_select_dataset_root(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择dataset目录", str(self.ds_root))

@@ -1,0 +1,17 @@
+[flake8]
+exclude = venv,build,__pycache__,__init__.py
+ignore =
+    # line too long, fixed by black
+    E501,
+    # line break before binary operator
+    W503,
+    vnpy_evo\trader\constant.py: F401, F403
+    vnpy_evo\trader\database.py: F401, F403
+    vnpy_evo\trader\datafeed.py: F401, F403
+    vnpy_evo\trader\engine.py: F401, F403
+    vnpy_evo\trader\event.py: F401, F403
+    vnpy_evo\trader\gateway.py: F401, F403
+    vnpy_evo\trader\object.py: F401, F403
+    vnpy_evo\trader\optimize.py: F401, F403
+    vnpy_evo\trader\setting.py: F401, F403
+    vnpy_evo\trader\utility.py: F401, F403
