@@ -16,6 +16,7 @@ from pathlib import Path
 from PyQt5.QtCore import QDate, Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDateEdit,
     QDoubleSpinBox,
     QFormLayout,
@@ -70,13 +71,14 @@ class _BacktestWorker(QThread):
             ep = self._engine_params
             sp = self._strategy_params
 
+            mode = MatchingMode(ep.get("matching_mode", "smart_tick_delay_fill"))
             self.log_signal.emit(
                 f"创建引擎: capital={ep['initial_capital']:,.0f}, "
-                f"mode=SMART_TICK_DELAY_FILL"
+                f"mode={mode.name}"
             )
             engine = BacktestEngine(
                 dataset_dir=ep["dataset_dir"],
-                mode=MatchingMode.SMART_TICK_DELAY_FILL,
+                mode=mode,
                 initial_capital=ep["initial_capital"],
                 rate=ep["rate"],
                 slippage=ep["slippage"],
@@ -486,6 +488,17 @@ class LauncherWidget(QWidget):
         )
         self._le_dataset = QLineEdit("dataset")
         self._le_dataset.setToolTip(_TOOLTIPS["dataset_dir"])
+        self._combo_mode = QComboBox()
+        self._combo_mode.addItem("SMART_TICK_DELAY_FILL", "smart_tick_delay_fill")
+        self._combo_mode.addItem("TICK_FILL", "tick_fill")
+        self._combo_mode.addItem("CLOSE_FILL", "close_fill")
+        self._combo_mode.setToolTip(
+            "撮合模式:\n"
+            "SMART_TICK_DELAY_FILL — 延迟深度撮合（推荐，最真实）\n"
+            "TICK_FILL — Tick 即时全量成交（更快但偏乐观）\n"
+            "CLOSE_FILL — 日线收盘价模式"
+        )
+        f.addRow("撮合模式:", self._combo_mode)
         f.addRow("初始资金:", self._sp_capital)
         f.addRow("手续费率:", self._sp_rate)
         f.addRow("滑点:", self._sp_slippage)
@@ -566,6 +579,7 @@ class LauncherWidget(QWidget):
 
         engine_params = {
             "dataset_dir": self._le_dataset.text().strip(),
+            "matching_mode": self._combo_mode.currentData(),
             "initial_capital": self._sp_capital.value(),
             "rate": self._sp_rate.value(),
             "slippage": self._sp_slippage.value(),
@@ -707,6 +721,10 @@ class LauncherWidget(QWidget):
             self._sp_credit_ratio.setValue(ep["credit_ratio"])
         if "enable_t0" in ep:
             self._cb_engine_t0.setChecked(ep["enable_t0"])
+        if "matching_mode" in ep:
+            idx = self._combo_mode.findData(ep["matching_mode"])
+            if idx >= 0:
+                self._combo_mode.setCurrentIndex(idx)
 
         # 策略参数
         if "symbols" in sp:

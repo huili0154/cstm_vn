@@ -1,0 +1,46 @@
+{
+  "engine": {
+    "dataset_dir": "dataset",
+    "matching_mode": "smart_tick_delay_fill",
+    "initial_capital": 100000.0,
+    "rate": 0.0001,
+    "slippage": 0.0,
+    "pricetick": 0.001,
+    "volume_limit_ratio": 1.0,
+    "credit_ratio": 0.5,
+    "enable_t0": true
+  },
+  "strategy": {
+    "symbol_a": "159655.SZ",
+    "symbol_b": "513500.SH",
+    "start_date": "20250701",
+    "end_date": "20251231",
+    "bar_interval_minutes": 15,
+    "window_minutes": 20,
+    "window_days": 20,
+    "k_sigma_minutes": 2.0,
+    "k_sigma_days": 2.0,
+    "thresh_sigma_min": 0.8,
+    "thresh_sigma_min_high": 2.55,
+    "thresh_sigma_day": 0.4,
+    "thresh_delta_min": 0.002,
+    "cooldown_seconds": 1800,
+    "trading_cutoff_str": "14:55:00",
+    "block_timeout_minutes": 20,
+    "timeout_recover_minutes": 10,
+    "timeout_recover_policy": "balance",
+    "chase_wait_ticks": 3,
+    "max_chase_rounds": 30,
+    "passive_slice_count": 3,
+    "cancel_priority": "newest_unfilled_first",
+    "base_pct": 0.2,
+    "high_pct": 0.3,
+    "enable_t0": true
+  },
+  "initial_positions": {
+    "159300": {
+      "volume": 61900,
+      "cost_price": 1.6144
+    }
+  }
+}

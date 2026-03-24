@@ -353,12 +353,19 @@ def reset(self) -> None:
         则最早在 tick3 才能参与撮合。保证了至少经过一个完整快照间隔。
 
 
-═══ 成交量增量 (volume_delta) ═══
+═══ 成交量增量 (volume_delta) — 消耗式流动性池 ═══
 
   volume_delta = tick.cum_volume - 上一个 tick 的 cum_volume
   含义: 本快照时段内场内的真实成交量，是市场流动性的直接度量。
   用途: 所有模式（主动/被动/市价）的可成交量都受 volume_delta 约束，
         确保不高估可得流动性。
+
+  关键规则: volume_delta 是消耗式的 (remaining_delta)。
+    - 逐档扫描时: 每档成交 fill_vol 后，remaining_delta -= fill_vol
+    - 跨订单时: 同一 tick 的多个订单共享同一个 remaining_delta，
+      先匹配的订单消耗的流动性会减少后续订单的可用量。
+    - 这保证了: 单个 tick 内所有订单的总成交量 ≤ volume_delta × volume_limit_ratio
+      （不会超过市场真实提供的流动性）。
 
 
 ═══ 市价单撮合 (_match_market_order_smart) ═══
@@ -369,25 +376,30 @@ def reset(self) -> None:
 
   买单 (Direction.BUY):
     前提: tick.ask_price_1 > 0 （有卖盘）
-    max_fill = int( min(tick.ask_volume_1, volume_delta) × volume_limit_ratio )
+    max_fill = _round_lot(int( min(tick.ask_volume_1, remaining_delta) × volume_limit_ratio ))
     fill_vol = min(max_fill, order.remaining)
     if fill_vol > 0:
       成交价 = tick.ask_price_1
       trade = _make_trade(order, ask_price_1, fill_vol, tick.datetime)
+      remaining_delta -= fill_vol   # 消耗流动性
 
   卖单 (Direction.SELL):
     前提: tick.bid_price_1 > 0 （有买盘）
-    max_fill = int( min(tick.bid_volume_1, volume_delta) × volume_limit_ratio )
+    max_fill = _round_lot(int( min(tick.bid_volume_1, remaining_delta) × volume_limit_ratio ))
     fill_vol = min(max_fill, order.remaining)
     if fill_vol > 0:
       成交价 = tick.bid_price_1
       trade = _make_trade(order, bid_price_1, fill_vol, tick.datetime)
+      remaining_delta -= fill_vol   # 消耗流动性
+
+  返回值: (trades, consumed_delta)  — consumed_delta = fill_vol
 
   示例:
-    委托买入 100000 份, ask_volume_1=50000, volume_delta=80000, ratio=0.5
-    max_fill = int(min(50000, 80000) × 0.5) = 25000
+    委托买入 100000 份, ask_volume_1=50000, remaining_delta=80000, ratio=0.5
+    max_fill = _round_lot(int(min(50000, 80000) × 0.5)) = 25000
     fill_vol = min(25000, 100000) = 25000
     → 本 tick 成交 25000 份 @ ask_price_1，剩余 75000 等下个 tick
+    → remaining_delta 减少 25000，后续订单可用 remaining_delta = 55000
 
 
 ═══ 限价单撮合 — 主动吃盘口 (Aggressive Fill) ═══
@@ -399,45 +411,58 @@ def reset(self) -> None:
   买单流程 (_match_buy_limit_smart):
     ask_prices = tick.ask_prices()    # [ask_1, ask_2, ..., ask_10]
     ask_volumes = tick.ask_volumes()  # [ask_vol_1, ..., ask_vol_10]
+    remaining_delta = 传入的剩余流动性
     for i in range(10):
-      if order.remaining <= 0: break
+      if order.remaining <= 0 or remaining_delta <= 0: break
       ap, av = ask_prices[i], ask_volumes[i]
       if ap <= 0 or av <= 0: continue   # 该档无数据
       if order.price < ap: break        # 委托价不够吃到这一档
 
-      max_fill = int( min(av, volume_delta) × volume_limit_ratio )
+      max_fill = _round_lot(int( min(av, remaining_delta) × volume_limit_ratio ))
       fill_vol = min(max_fill, order.remaining)
       if fill_vol > 0:
         trade = _make_trade(order, ap, fill_vol, tick.datetime)
+        remaining_delta -= fill_vol    # 消耗流动性，影响后续档位
         # 注意: 成交价 = 该档实际价格，不是委托价
 
   卖单流程 (_match_sell_limit_smart):
     对称处理，从 bid_price_1 到 bid_price_10 逐档扫:
     for each level:
       if order.price > bp: break       # 卖价高于该档买价，不可成交
-      max_fill = int( min(bv, volume_delta) × volume_limit_ratio )
+      max_fill = _round_lot(int( min(bv, remaining_delta) × volume_limit_ratio ))
       fill_vol = min(max_fill, order.remaining)
       成交价 = bp (该档买盘价格)
+      remaining_delta -= fill_vol      # 消耗流动性
+
+  返回值: (trades, consumed_delta)  — consumed_delta = 所有档位 fill_vol 之和
 
   示例: 卖单委托价 3.995, 盘口如下:
     买一: 3.999 × 30000
     买二: 3.998 × 20000
     买三: 3.997 × 10000
-    volume_delta = 100000, ratio = 0.5
+    remaining_delta = 100000, ratio = 0.5
 
     第1档: 3.995 ≤ 3.999 → 可吃
-      max_fill = int(min(30000, 100000) × 0.5) = 15000
-      → 成交 15000 @ 3.999
+      max_fill = _round_lot(int(min(30000, 100000) × 0.5)) = 15000
+      → 成交 15000 @ 3.999, remaining_delta = 85000
 
     第2档: 3.995 ≤ 3.998 → 可吃
-      max_fill = int(min(20000, 100000) × 0.5) = 10000
-      → 成交 10000 @ 3.998
+      max_fill = _round_lot(int(min(20000, 85000) × 0.5)) = 10000
+      → 成交 10000 @ 3.998, remaining_delta = 75000
 
     第3档: 3.995 ≤ 3.997 → 可吃
-      max_fill = int(min(10000, 100000) × 0.5) = 5000
-      → 成交 5000 @ 3.997
+      max_fill = _round_lot(int(min(10000, 75000) × 0.5)) = 5000
+      → 成交 5000 @ 3.997, remaining_delta = 70000
 
     总成交: 15000+10000+5000 = 30000 份, 分 3 笔 Trade, 各档价格不同
+    consumed_delta = 30000
+
+  消耗式的关键差异（对比旧实现）:
+    当 remaining_delta 较小时，后续档位可用量会显著减少。
+    例: remaining_delta=20000, 5档各50000, ratio=0.5
+      旧实现: 每档 min(50000,20000)×0.5=10000, 共50000 — 超过实际流动性!
+      新实现: 第1档 10000, 第2档 min(50000,10000)×0.5=5000,
+              第3档 min(50000,5000)×0.5=2500... 总计≤20000 ✓
 
 
 ═══ 限价单撮合 — 被动排队 (Passive Queue, _passive_queue_fill) ═══

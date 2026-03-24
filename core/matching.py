@@ -339,7 +339,7 @@ class MatchingEngine:
     def _match_tick_smart(self, tick: TickData) -> list[Trade]:
         """smart_tick_delay_fill 模式。"""
         trades: list[Trade] = []
-        volume_delta = self._get_volume_delta(tick)
+        remaining_delta = self._get_volume_delta(tick)
 
         for order in list(self._active_orders.values()):
             if order.symbol != tick.symbol:
@@ -359,16 +359,25 @@ class MatchingEngine:
                     self._notify_order(order)
                 continue
 
+            # 无剩余流动性，跳过
+            if remaining_delta <= 0:
+                continue
+
             # SUBMITTING → ACTIVE
             if order.status == OrderStatus.SUBMITTING:
                 order.status = OrderStatus.ACTIVE
                 self._notify_order(order)
 
             if order.order_type == OrderType.MARKET:
-                new_trades = self._match_market_order_smart(order, tick, volume_delta)
+                new_trades, consumed = self._match_market_order_smart(
+                    order, tick, remaining_delta
+                )
             else:
-                new_trades = self._match_limit_order_smart(order, tick, volume_delta)
+                new_trades, consumed = self._match_limit_order_smart(
+                    order, tick, remaining_delta
+                )
 
+            remaining_delta -= consumed
             for t in new_trades:
                 self._notify_order(order)
                 self._notify_trade(t)
@@ -377,63 +386,68 @@ class MatchingEngine:
         return trades
 
     def _match_market_order_smart(
-        self, order: Order, tick: TickData, volume_delta: int
-    ) -> list[Trade]:
+        self, order: Order, tick: TickData, remaining_delta: int
+    ) -> tuple[list[Trade], int]:
         """
         市价单撮合（smart 模式）。
         只按当前最优价（ask_1 / bid_1）成交。
-        可成交量 = min(最优档挂单量, 快照成交量) × volume_limit_ratio。
+        可成交量 = min(最优档挂单量, 剩余可用流动性) × volume_limit_ratio。
+        返回 (trades, consumed_delta)。
         """
         trades: list[Trade] = []
 
         if order.direction == Direction.BUY:
             if tick.ask_price_1 <= 0:
-                return trades
+                return trades, 0
             max_fill = self._round_lot(int(
-                min(tick.ask_volume_1, volume_delta) * self.volume_limit_ratio
+                min(tick.ask_volume_1, remaining_delta) * self.volume_limit_ratio
             ))
             fill_vol = min(max_fill, order.remaining)
             if fill_vol > 0:
                 trade = self._make_trade(order, tick.ask_price_1, fill_vol, tick.datetime)
                 trades.append(trade)
+                return trades, fill_vol
         else:
             if tick.bid_price_1 <= 0:
-                return trades
+                return trades, 0
             max_fill = self._round_lot(int(
-                min(tick.bid_volume_1, volume_delta) * self.volume_limit_ratio
+                min(tick.bid_volume_1, remaining_delta) * self.volume_limit_ratio
             ))
             fill_vol = min(max_fill, order.remaining)
             if fill_vol > 0:
                 trade = self._make_trade(order, tick.bid_price_1, fill_vol, tick.datetime)
                 trades.append(trade)
+                return trades, fill_vol
 
-        return trades
+        return trades, 0
 
     def _match_limit_order_smart(
-        self, order: Order, tick: TickData, volume_delta: int
-    ) -> list[Trade]:
+        self, order: Order, tick: TickData, remaining_delta: int
+    ) -> tuple[list[Trade], int]:
         """
         限价单撮合（smart 模式）。
 
         - 主动吃盘口：委托价穿越对手盘 → 从第1档到第10档逐档匹配。
         - 被动排队：委托价未穿越 → 等对手方价格穿越本方，按成交量比例估算。
+        返回 (trades, consumed_delta)。
         """
         if order.direction == Direction.BUY:
-            return self._match_buy_limit_smart(order, tick, volume_delta)
+            return self._match_buy_limit_smart(order, tick, remaining_delta)
         else:
-            return self._match_sell_limit_smart(order, tick, volume_delta)
+            return self._match_sell_limit_smart(order, tick, remaining_delta)
 
     def _match_buy_limit_smart(
-        self, order: Order, tick: TickData, volume_delta: int
-    ) -> list[Trade]:
+        self, order: Order, tick: TickData, remaining_delta: int
+    ) -> tuple[list[Trade], int]:
         trades: list[Trade] = []
+        consumed = 0
         ask_prices = tick.ask_prices()
         ask_volumes = tick.ask_volumes()
 
         if tick.ask_price_1 > 0 and order.price >= tick.ask_price_1:
             # ═══ 主动吃卖盘 ═══
             for i in range(10):
-                if order.remaining <= 0:
+                if order.remaining <= 0 or remaining_delta <= 0:
                     break
                 ap = ask_prices[i]
                 av = ask_volumes[i]
@@ -443,31 +457,36 @@ class MatchingEngine:
                     break  # 委托价不够吃到这一档
 
                 max_fill = self._round_lot(int(
-                    min(av, volume_delta) * self.volume_limit_ratio
+                    min(av, remaining_delta) * self.volume_limit_ratio
                 ))
                 fill_vol = min(max_fill, order.remaining)
                 if fill_vol > 0:
                     trade = self._make_trade(order, ap, fill_vol, tick.datetime)
                     trades.append(trade)
+                    remaining_delta -= fill_vol
+                    consumed += fill_vol
         else:
             # ═══ 被动排队等待 ═══
-            trades.extend(
-                self._passive_queue_fill(order, tick, volume_delta, is_buy=True)
+            queue_trades, queue_consumed = self._passive_queue_fill(
+                order, tick, remaining_delta, is_buy=True
             )
+            trades.extend(queue_trades)
+            consumed += queue_consumed
 
-        return trades
+        return trades, consumed
 
     def _match_sell_limit_smart(
-        self, order: Order, tick: TickData, volume_delta: int
-    ) -> list[Trade]:
+        self, order: Order, tick: TickData, remaining_delta: int
+    ) -> tuple[list[Trade], int]:
         trades: list[Trade] = []
+        consumed = 0
         bid_prices = tick.bid_prices()
         bid_volumes = tick.bid_volumes()
 
         if tick.bid_price_1 > 0 and order.price <= tick.bid_price_1:
             # ═══ 主动吃买盘 ═══
             for i in range(10):
-                if order.remaining <= 0:
+                if order.remaining <= 0 or remaining_delta <= 0:
                     break
                 bp = bid_prices[i]
                 bv = bid_volumes[i]
@@ -477,39 +496,44 @@ class MatchingEngine:
                     break
 
                 max_fill = self._round_lot(int(
-                    min(bv, volume_delta) * self.volume_limit_ratio
+                    min(bv, remaining_delta) * self.volume_limit_ratio
                 ))
                 fill_vol = min(max_fill, order.remaining)
                 if fill_vol > 0:
                     trade = self._make_trade(order, bp, fill_vol, tick.datetime)
                     trades.append(trade)
+                    remaining_delta -= fill_vol
+                    consumed += fill_vol
         else:
             # ═══ 被动排队等待 ═══
-            trades.extend(
-                self._passive_queue_fill(order, tick, volume_delta, is_buy=False)
+            queue_trades, queue_consumed = self._passive_queue_fill(
+                order, tick, remaining_delta, is_buy=False
             )
+            trades.extend(queue_trades)
+            consumed += queue_consumed
 
-        return trades
+        return trades, consumed
 
     def _passive_queue_fill(
         self,
         order: Order,
         tick: TickData,
-        volume_delta: int,
+        remaining_delta: int,
         is_buy: bool,
-    ) -> list[Trade]:
+    ) -> tuple[list[Trade], int]:
         """
         被动挂单排队估算。
 
         买单挂在 order.price 等待：如果 last_price <= order.price 且有成交量，
         按比例估算可获得的成交量。
         queue_factor=0.5 假设我们排在队列中间位置。
+        返回 (trades, consumed_delta)。
         """
         trades: list[Trade] = []
         queue_factor = 0.5
 
-        if volume_delta <= 0:
-            return trades
+        if remaining_delta <= 0:
+            return trades, 0
 
         if is_buy:
             # 买单等卖方价格下来
@@ -517,7 +541,7 @@ class MatchingEngine:
                 # 估算该价格档的总挂单量，用 bid_volume 近似
                 level_volume = tick.bid_volume_1 if tick.bid_volume_1 > 0 else 1
                 estimated = self._round_lot(int(
-                    volume_delta
+                    remaining_delta
                     * (order.remaining / max(level_volume, order.remaining))
                     * queue_factor
                 ))
@@ -527,12 +551,13 @@ class MatchingEngine:
                         order, order.price, fill_vol, tick.datetime
                     )
                     trades.append(trade)
+                    return trades, fill_vol
         else:
             # 卖单等买方价格上来
             if tick.last_price >= order.price and tick.last_price > 0:
                 level_volume = tick.ask_volume_1 if tick.ask_volume_1 > 0 else 1
                 estimated = self._round_lot(int(
-                    volume_delta
+                    remaining_delta
                     * (order.remaining / max(level_volume, order.remaining))
                     * queue_factor
                 ))
@@ -542,8 +567,9 @@ class MatchingEngine:
                         order, order.price, fill_vol, tick.datetime
                     )
                     trades.append(trade)
+                    return trades, fill_vol
 
-        return trades
+        return trades, 0
 
     # ────────────────────────────────────────────────
     #  统一入口

@@ -1,8 +1,9 @@
 {
   "engine": {
     "dataset_dir": "dataset",
+    "matching_mode": "tick_fill",
     "initial_capital": 50000.0,
-    "rate": 0.0003,
+    "rate": 0.0001,
     "slippage": 0.0,
     "pricetick": 0.001,
     "volume_limit_ratio": 1.0,
@@ -14,11 +15,11 @@
       "513500.SH",
       "159655.SZ"
     ],
-    "start_date": "20250102",
+    "start_date": "20250601",
     "end_date": "20251231",
-    "window": 6,
-    "k_threshold": 0.84,
-    "least_bias": 0.0038,
+    "window": 5,
+    "k_threshold": 0.2,
+    "least_bias": 0.004,
     "num_blocks": 3,
     "sub_lots": 3,
     "cooldown_1": 20,

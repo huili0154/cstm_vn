@@ -542,6 +542,9 @@ class BacktestEngine(EngineBase):
                     # 3. 推给策略
                     strategy.on_tick(primary_tick)
 
+                # 日终: 撤销未完成挂单，释放冻结资源
+                self.cancel_all(strategy)
+
                 # 日终: 更新所有持仓市价 & 记录净值
                 bar_today = bars_map.get(date_str)
                 if bar_today:
@@ -652,11 +655,12 @@ class BacktestEngine(EngineBase):
 
     def _calc_nav(self) -> float:
         """
-        计算当前净值 = 可用资金 + 冻结资金 + 所有持仓市值。
+        计算当前净值 = 账户总资金 + 所有持仓市值。
 
-        注: balance 已被 trade 回调扣减/增加过，所以直接用 balance + frozen + 持仓市值。
+        注: Account.balance 定义为总资金（含冻结），
+        所以这里不能再重复加 frozen。
         """
-        nav = self._account.balance + self._account.frozen
+        nav = self._account.balance
         for pos in self._positions.values():
             if pos.volume > 0:
                 nav += pos.volume * pos.market_price

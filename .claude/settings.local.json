@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(python -m pytest tests/test_matching.py -v)",
+      "Bash(python -m pytest tests/test_matching_volume.py -v)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(start:*)",
+      "Bash(python3:*)",
+      "Bash(for symbol:*)",
+      "Bash(do)",
+      "Bash(echo \"=== $symbol ===\")",
+      "Read(//c/Users/Hui Li/Documents/trae_projects/cstm_vn/dataset/**)",
+      "Bash(done)",
+      "Bash(python -m pytest tests/test_matching_real_data.py -v)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); msg=d.get\\(''''message'''',{}\\); c=msg.get\\(''''content'''',''''''''\\); print\\(c[:5000] if isinstance\\(c,str\\) else str\\(c\\)[:5000]\\)\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); msg=d.get\\(''''message'''',{}\\); c=msg.get\\(''''content'''',''''''''\\); txt = c if isinstance\\(c,str\\) else str\\(c\\); print\\(txt[:8000]\\)\")",
+      "Bash(for line:*)",
+      "Bash(do echo:*)",
+      "Bash(sed -n \"$linep\" \"/c/Users/Hui Li/.claude/projects/C--Users-Hui-Li-Documents-trae-projects-cstm-vn/78379c23-6397-4a48-9c1e-1ec92d674532.jsonl\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); msg=d.get\\(''''message'''',{}\\); c=msg.get\\(''''content'''',''''''''\\); txt=c if isinstance\\(c,str\\) else str\\(c\\); print\\(txt[:3000]\\)\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); msg=d.get\\(''''message'''',{}\\); c=msg.get\\(''''content'''',''''''''\\); txt=c if isinstance\\(c,str\\) else str\\(c\\); print\\(txt[:6000]\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python _analyze_513500.py)",
+      "Bash(python _analyze_all_ticks.py)",
+      "Bash(tasklist)",
+      "Bash(python _compare_windows.py)"
+    ]
+  }
+}
