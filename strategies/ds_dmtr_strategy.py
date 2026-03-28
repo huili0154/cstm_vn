@@ -18,6 +18,7 @@ from enum import Enum
 from core.data_feed import ParquetBarFeed, ParquetTickFeed
 from core.datatypes import BarData, Direction, Order, OrderStatus, TickData, Trade
 from core.strategy import StrategyBase
+from strategies.decisions import DecisionContext, create_decision
 
 
 # ════════════════════════════════════════════════════════════════
@@ -36,6 +37,7 @@ class BlockState(Enum):
     TIMEOUT = "TIMEOUT"
     CRITICAL = "CRITICAL"
     REJECTED = "REJECTED"       # 被拒绝
+    REVERTED = "REVERTED"       # 信号失效，提前终止
 
 
 @dataclass
@@ -79,6 +81,7 @@ class RotationBlock:
     mu_day: float = 0.0
     sigma_day: float = 0.0
     a_percentage: float = 0.0
+    signal_reason: str = ""          # 决策器给出的触发原因
 
     # ── 信号时市场价格 ──
     sell_signal_price: float = 0.0
@@ -292,9 +295,15 @@ class DsDmtrStrategy(StrategyBase):
     cancel_priority: str = "newest_unfilled_first"
     base_pct: float = 0.1
     high_pct: float = 0.3
+    min_order_ratio: float = 0.1
+    open_wait_minutes: int = 5
+    enable_signal_check: bool = True
 
     # ── T+0 parameter ──
     enable_t0: bool = False
+
+    # ── 决策器类型 ──
+    decision_type: str = "original"
 
     parameters = [
         "symbol_a", "symbol_b", "dataset_dir",
@@ -307,8 +316,10 @@ class DsDmtrStrategy(StrategyBase):
         "timeout_recover_policy",
         "chase_wait_ticks", "max_chase_rounds",
         "passive_slice_count", "cancel_priority",
-        "base_pct", "high_pct",
+        "base_pct", "high_pct", "min_order_ratio", "open_wait_minutes",
+        "enable_signal_check",
         "enable_t0",
+        "decision_type",
     ]
 
     variables = [
@@ -376,6 +387,9 @@ class DsDmtrStrategy(StrategyBase):
 
         # 交易日志（供 GUI 使用，保留兼容）
         self._trade_logs: list[dict] = []
+
+        # ── 可插拔决策器 ──
+        self._decision = create_decision(self.decision_type, setting)
 
     # ────────────────────────────────────────────────
     #  on_init
@@ -651,6 +665,18 @@ class DsDmtrStrategy(StrategyBase):
         if tick_time >= self._trading_cutoff_time:
             return
 
+        # 开盘等待：避免开盘波动期发出信号
+        if self.open_wait_minutes > 0:
+            open_time = time(9, 30, 0)
+            wait_end = time(
+                9, 30 + self.open_wait_minutes, 0
+            ) if self.open_wait_minutes <= 30 else time(
+                9 + (30 + self.open_wait_minutes) // 60,
+                (30 + self.open_wait_minutes) % 60, 0
+            )
+            if open_time <= tick_time < wait_end:
+                return
+
         pending = self.get_pending_orders()
         if pending:
             return
@@ -665,12 +691,37 @@ class DsDmtrStrategy(StrategyBase):
         if remaining_min < self.block_timeout_minutes:
             return
 
-        should_act, direction, trade_pct = self._decide(tick.datetime)
-        if should_act:
-            self._execute(direction, trade_pct, tick.datetime, nav)
+        ctx = self._build_decision_context(tick.datetime)
+        signal = self._decision.decide(ctx)
+        if signal:
+            self._execute(signal.direction, signal.trade_pct, tick.datetime, nav,
+                          signal_reason=signal.reason)
 
     # ────────────────────────────────────────────────
-    #  决策函数
+    #  决策上下文构建
+    # ────────────────────────────────────────────────
+
+    def _build_decision_context(self, current_time: datetime) -> DecisionContext:
+        """从策略当前状态构建 DecisionContext 只读快照。"""
+        return DecisionContext(
+            ab_ratio=self.ab_ratio,
+            mu_min=self.mu_min,
+            sigma_min=self.sigma_min,
+            mu_day=self.mu_day,
+            sigma_day=self.sigma_day,
+            delta_sigma_minutes=self.delta_sigma_minutes,
+            delta_sigma_days=self.delta_sigma_days,
+            delta_minutes=self.delta_minutes,
+            min_stats_valid=self._min_stats_valid,
+            day_stats_valid=self._day_stats_valid,
+            a_percentage=self.a_percentage,
+            last_trade_direction=self._last_trade_direction,
+            last_trade_time=self._last_trade_time,
+            current_time=current_time,
+        )
+
+    # ────────────────────────────────────────────────
+    #  决策函数（保留，供向后兼容）
     # ────────────────────────────────────────────────
 
     def _decide(
@@ -731,6 +782,7 @@ class DsDmtrStrategy(StrategyBase):
         trade_pct: float,
         current_time: datetime,
         nav: float,
+        signal_reason: str = "",
     ) -> None:
         """执行轮动交易，并创建 RotationBlock 跟踪。"""
         if direction == "SELL_A_BUY_B":
@@ -773,6 +825,22 @@ class DsDmtrStrategy(StrategyBase):
         if sell_volume < 100 and buy_volume < 100:
             return
 
+        # min_order_ratio 检查：两腿发单量都低于期望量的比例时放弃
+        if self.min_order_ratio > 0:
+            sell_ok = (desired_sell_vol == 0) or (
+                sell_volume >= desired_sell_vol * self.min_order_ratio
+            )
+            buy_ok = (desired_buy_vol == 0) or (
+                buy_volume >= desired_buy_vol * self.min_order_ratio
+            )
+            if not sell_ok and not buy_ok:
+                self.write_log(
+                    f"SKIP block: min_order_ratio={self.min_order_ratio} "
+                    f"sell={sell_volume}/{desired_sell_vol} "
+                    f"buy={buy_volume}/{desired_buy_vol}"
+                )
+                return
+
         self._block_seq += 1
         trade_date = current_time.strftime("%Y%m%d")
         block = RotationBlock(
@@ -795,6 +863,7 @@ class DsDmtrStrategy(StrategyBase):
             mu_day=self.mu_day,
             sigma_day=self.sigma_day,
             a_percentage=self.a_percentage,
+            signal_reason=signal_reason,
             # 市场价格
             sell_signal_price=sell_price,
             buy_signal_price=buy_price,
@@ -1307,6 +1376,48 @@ class DsDmtrStrategy(StrategyBase):
             return abs(block.sell_cost - block.buy_cost) < 1e-6
         return abs(block.sell_cost - block.buy_cost) < lot_amt
 
+    def _check_signal_reversion(
+        self, block: RotationBlock, now: datetime
+    ) -> bool:
+        """检测信号是否失效。失效时处理再平衡并 finalize block。
+
+        返回 True 表示已处理（block 已终止或进入 rebalance chase）。
+        """
+        if not self.enable_signal_check:
+            return False
+
+        ctx = self._build_decision_context(now)
+        if self._decision.is_still_valid(ctx, block.direction):
+            return False  # 信号仍然有效
+
+        # 信号失效
+        if self._is_balanced(block):
+            # Case 1: 已对等（或双零），直接撤单结束
+            self._cancel_block_orders(block)
+            self.write_log(
+                f"REVERT {block.block_id}: signal invalid, balanced "
+                f"sell_cost={block.sell_cost:.2f} buy_cost={block.buy_cost:.2f}"
+            )
+            self._finalize_block(block, now, BlockState.REVERTED)
+            return True
+
+        # Case 2: 不对等，全部撤单后追齐少的一方
+        self._cancel_block_orders(block)
+        side, gap_qty = self._calc_gap_qty(block)
+        if side and gap_qty >= 100:
+            self.write_log(
+                f"REVERT {block.block_id}: signal invalid, rebalance "
+                f"chase {side} {gap_qty} "
+                f"sell_cost={block.sell_cost:.2f} buy_cost={block.buy_cost:.2f}"
+            )
+            self._start_immediate_chase(block, side, now, gap_qty)
+        else:
+            self.write_log(
+                f"REVERT {block.block_id}: signal invalid, no gap to chase"
+            )
+            self._finalize_block(block, now, BlockState.REVERTED)
+        return True
+
     def _manage_active_block(self, tick: TickData) -> None:
         block = self._active_block
         if not block:
@@ -1316,6 +1427,11 @@ class DsDmtrStrategy(StrategyBase):
         if self._is_block_complete(block):
             self._finalize_block(block, now, BlockState.DONE)
             return
+
+        # 信号失效检测（仅 PENDING/MATCHING 阶段，CHASING 阶段不中断）
+        if block.state in (BlockState.PENDING, BlockState.MATCHING):
+            if self._check_signal_reversion(block, now):
+                return
 
         if self._timeout_expired(block, now):
             self._handle_block_timeout(block, now)

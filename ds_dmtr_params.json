@@ -13,34 +13,35 @@
   "strategy": {
     "symbol_a": "159655.SZ",
     "symbol_b": "513500.SH",
-    "start_date": "20250701",
+    "start_date": "20250101",
     "end_date": "20251231",
-    "bar_interval_minutes": 15,
-    "window_minutes": 20,
+    "bar_interval_minutes": 30,
+    "window_minutes": 15,
     "window_days": 20,
     "k_sigma_minutes": 2.0,
     "k_sigma_days": 2.0,
     "thresh_sigma_min": 0.8,
     "thresh_sigma_min_high": 2.55,
     "thresh_sigma_day": 0.4,
-    "thresh_delta_min": 0.002,
+    "thresh_delta_min": 0.0025,
     "cooldown_seconds": 1800,
     "trading_cutoff_str": "14:55:00",
     "block_timeout_minutes": 20,
-    "timeout_recover_minutes": 10,
+    "timeout_recover_minutes": 8,
     "timeout_recover_policy": "balance",
     "chase_wait_ticks": 3,
     "max_chase_rounds": 30,
     "passive_slice_count": 3,
     "cancel_priority": "newest_unfilled_first",
-    "base_pct": 0.2,
+    "base_pct": 0.32,
     "high_pct": 0.3,
+    "min_order_ratio": 0.1,
+    "open_wait_minutes": 5,
+    "enable_signal_check": true,
     "enable_t0": true
   },
   "initial_positions": {
-    "159300": {
-      "volume": 61900,
-      "cost_price": 1.6144
-    }
+    "pct_a": 50,
+    "pct_b": 50
   }
 }

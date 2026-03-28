@@ -388,10 +388,11 @@ class BacktestEngine(EngineBase):
         self._daily_nav.clear()
         self._logs.clear()
 
-        # 注入初始持仓
+        # 注入初始持仓（从初始资金中扣除持仓成本）
         if initial_positions:
             for sym, (vol, cp) in initial_positions.items():
                 self._positions[sym] = Position(symbol=sym, volume=vol, cost_price=cp, enable_t0=self._enable_t0)
+                self._account.balance -= vol * cp
 
         # 策略生命周期
         self._progress_cb("正在加载日线数据 (on_init)...")

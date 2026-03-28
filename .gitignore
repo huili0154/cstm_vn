@@ -80,6 +80,7 @@ outputs/
 
 # Temporary analysis/diagnostic scripts
 _*.py
+!__init__.py
 _narrative_output.txt
 
 # mypy

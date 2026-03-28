@@ -109,9 +109,29 @@ def main() -> None:
     end = strat_cfg.get("end_date", "20251231")
     initial_positions = params.get("initial_positions", {})
     pos_dict = {}
-    for sym, info in initial_positions.items():
-        if isinstance(info, (list, tuple)) and len(info) == 2:
-            pos_dict[sym] = (int(info[0]), float(info[1]))
+    if "pct_a" in initial_positions or "pct_b" in initial_positions:
+        # 百分比模式：根据前一交易日收盘价计算
+        from core.data_feed import ParquetBarFeed
+        bar_feed = ParquetBarFeed(eng_cfg["dataset_dir"])
+        capital = eng_cfg.get("initial_capital", 100_000.0)
+        for sym, pct_key in [(symbols[0], "pct_a"), (symbols[1], "pct_b")]:
+            pct = initial_positions.get(pct_key, 0)
+            if pct <= 0:
+                continue
+            bars = bar_feed.load(sym, end_date=start)
+            prev_bars = [b for b in bars if b.datetime.strftime("%Y%m%d") < start]
+            if not prev_bars:
+                continue
+            close = prev_bars[-1].close_price
+            if close <= 0:
+                continue
+            vol = int(capital * pct / 100.0 / close / 100) * 100
+            if vol >= 100:
+                pos_dict[sym] = (vol, close)
+    else:
+        for sym, info in initial_positions.items():
+            if isinstance(info, (list, tuple)) and len(info) == 2:
+                pos_dict[sym] = (int(info[0]), float(info[1]))
 
     print(f"回测: {symbols}  {start} ~ {end}")
     print(f"撮合模式: {mode.name}")

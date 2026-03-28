@@ -54,13 +54,15 @@ class _BacktestWorker(QThread):
         self,
         engine_params: dict,
         strategy_params: dict,
-        initial_positions: dict | None = None,
+        pct_a: int = 0,
+        pct_b: int = 0,
         parent=None,
     ):
         super().__init__(parent)
         self._engine_params = engine_params
         self._strategy_params = strategy_params
-        self._initial_positions = initial_positions
+        self._pct_a = pct_a
+        self._pct_b = pct_b
 
     def run(self):
         try:
@@ -110,9 +112,16 @@ class _BacktestWorker(QThread):
                 setting=setting,
             )
 
-            init_pos = self._initial_positions
-            if init_pos:
-                self.log_signal.emit(f"初始仓位: {init_pos}")
+            # 根据百分比计算初始持仓
+            init_pos = None
+            if self._pct_a > 0 or self._pct_b > 0:
+                init_pos = self._calc_initial_positions(
+                    ep["dataset_dir"], symbol_a, symbol_b,
+                    ep["initial_capital"], sp["start_date"],
+                    self._pct_a, self._pct_b,
+                )
+                if init_pos:
+                    self.log_signal.emit(f"初始持仓: {init_pos}")
 
             # on_init (加载日线)
             self.log_signal.emit("正在加载日线数据...")
@@ -137,6 +146,44 @@ class _BacktestWorker(QThread):
 
         except Exception:
             self.error_signal.emit(traceback.format_exc())
+
+    @staticmethod
+    def _calc_initial_positions(
+        dataset_dir: str,
+        symbol_a: str,
+        symbol_b: str,
+        capital: float,
+        start_date: str,
+        pct_a: int,
+        pct_b: int,
+    ) -> dict[str, tuple[int, float]] | None:
+        """根据百分比和回测前一交易日收盘价计算初始持仓。"""
+        from core.data_feed import ParquetBarFeed
+
+        bar_feed = ParquetBarFeed(dataset_dir)
+        result = {}
+
+        for sym, pct in [(symbol_a, pct_a), (symbol_b, pct_b)]:
+            if pct <= 0:
+                continue
+            # 加载 start_date 之前的日线，取最后一条作为前一交易日
+            bars = bar_feed.load(sym, end_date=start_date)
+            # 找到严格 < start_date 的最后一根 bar
+            prev_bars = [
+                b for b in bars
+                if b.datetime.strftime("%Y%m%d") < start_date
+            ]
+            if not prev_bars:
+                continue
+            close = prev_bars[-1].close_price
+            if close <= 0:
+                continue
+            alloc = capital * pct / 100.0
+            vol = int(alloc / close / 100) * 100
+            if vol >= 100:
+                result[sym] = (vol, close)
+
+        return result if result else None
 
 
 # ────────────────────────────────────────────────
@@ -196,6 +243,9 @@ _TOOLTIPS = {
     "cancel_priority": "撤单优先级。\nnewest_unfilled_first=优先撤最新且未成交子单。",
     "base_pct": "基础轮动比例。\n满足基础条件时交易净值的此比例。",
     "high_pct": "加码轮动比例。\n满足加码条件时交易净值的此比例。",
+    "min_order_ratio": "最低发单比例。\n买卖两腿实际发单量都低于期望量的此比例时放弃 block。\n0 = 不过滤。",
+    "open_wait_minutes": "开盘等待分钟数。\n开盘后此时间内不发出新信号，避免开盘波动导致大滑价。\n0 = 不等待。",
+    "enable_signal_check": "执行中信号失效检测。\n启用后，block 执行中若信号回归则提前终止并再平衡。",
     # 引擎参数
     "initial_capital": "回测初始资金 (元)。",
     "rate": "委托手续费率。\nETF 一般为万 0.5 = 0.00005。",
@@ -439,30 +489,34 @@ class LauncherWidget(QWidget):
         f.addRow("delta偏离门限:", self._sp_thresh_delta_min)
         self._sp_base_pct = self._spin_d(0.01, 1.0, 0.1, 2, 0.01, "base_pct")
         self._sp_high_pct = self._spin_d(0.01, 1.0, 0.3, 2, 0.01, "high_pct")
+        self._sp_min_order_ratio = self._spin_d(0.0, 1.0, 0.1, 2, 0.01, "min_order_ratio")
         f.addRow("基础比例:", self._sp_base_pct)
         f.addRow("加码比例:", self._sp_high_pct)
+        f.addRow("最低发单比例:", self._sp_min_order_ratio)
         return grp
 
     def _build_grp_initial_positions(self) -> QGroupBox:
-        grp_ipos = QGroupBox("初始仓位 (可选)")
-        lay_ipos = QVBoxLayout(grp_ipos)
+        grp_ipos = QGroupBox("初始持仓比例 (可选)")
+        lay_ipos = QFormLayout(grp_ipos)
         lay_ipos.setContentsMargins(4, 8, 4, 4)
-        self._ipos_table = QTableWidget(0, 3)
-        self._ipos_table.setHorizontalHeaderLabels(["品种代码", "持仓量", "成本价"])
-        self._ipos_table.horizontalHeader().setStretchLastSection(True)
-        self._ipos_table.setMaximumHeight(80)
-        lay_ipos.addWidget(self._ipos_table)
-        ipos_btn = QHBoxLayout()
-        btn_add_pos = QPushButton("+")
-        btn_del_pos = QPushButton("-")
-        btn_add_pos.setFixedWidth(32)
-        btn_del_pos.setFixedWidth(32)
-        btn_add_pos.clicked.connect(self._add_position_row)
-        btn_del_pos.clicked.connect(self._del_position_row)
-        ipos_btn.addWidget(btn_add_pos)
-        ipos_btn.addWidget(btn_del_pos)
-        ipos_btn.addStretch()
-        lay_ipos.addLayout(ipos_btn)
+        self._sp_init_pct_a = QSpinBox()
+        self._sp_init_pct_a.setRange(0, 100)
+        self._sp_init_pct_a.setValue(50)
+        self._sp_init_pct_a.setSuffix("%")
+        self._sp_init_pct_a.setToolTip(
+            "初始持有 A 股票的资金比例。\n"
+            "按回测起始日前一交易日收盘价计算持仓量（向下取整到100股）。"
+        )
+        self._sp_init_pct_b = QSpinBox()
+        self._sp_init_pct_b.setRange(0, 100)
+        self._sp_init_pct_b.setValue(50)
+        self._sp_init_pct_b.setSuffix("%")
+        self._sp_init_pct_b.setToolTip(
+            "初始持有 B 股票的资金比例。\n"
+            "A% + B% 不得超过 100%。"
+        )
+        lay_ipos.addRow("A 股票比例:", self._sp_init_pct_a)
+        lay_ipos.addRow("B 股票比例:", self._sp_init_pct_b)
         return grp_ipos
 
     # ──────────────────────────
@@ -510,6 +564,8 @@ class LauncherWidget(QWidget):
             "策略层 T+0 开关。需引擎层也勾选 T+0，\n"
             "双方都开启时当日买入的仓位可当日卖出。"
         )
+        self._sp_open_wait = self._spin_i(0, 60, 5, "open_wait_minutes")
+        f.addRow("开盘等待(分钟):", self._sp_open_wait)
         f.addRow("冷却时间(秒):", self._sp_cooldown)
         f.addRow("截止时间(HH:MM:SS):", self._le_trading_cutoff)
         f.addRow("实现期(分钟):", self._sp_block_timeout)
@@ -519,7 +575,12 @@ class LauncherWidget(QWidget):
         f.addRow("追价最大轮数:", self._sp_max_chase_rounds)
         f.addRow("被动拆单数:", self._sp_passive_slice_count)
         f.addRow("撤单优先级:", self._combo_cancel_priority)
+        self._cb_signal_check = QCheckBox("执行中信号失效检测")
+        if "enable_signal_check" in _TOOLTIPS:
+            self._cb_signal_check.setToolTip(_TOOLTIPS["enable_signal_check"])
+        self._cb_signal_check.setChecked(True)
         f.addRow("", self._cb_strategy_t0)
+        f.addRow("", self._cb_signal_check)
         col.addWidget(grp_exec)
 
         return col
@@ -602,39 +663,9 @@ class LauncherWidget(QWidget):
     #  初始仓位表
     # ════════════════════════════════════════════════
 
-    def _add_position_row(self):
-        row = self._ipos_table.rowCount()
-        self._ipos_table.insertRow(row)
-        self._ipos_table.setItem(row, 0, QTableWidgetItem(""))
-        self._ipos_table.setItem(row, 1, QTableWidgetItem("0"))
-        self._ipos_table.setItem(row, 2, QTableWidgetItem("0.0"))
-
-    def _del_position_row(self):
-        row = self._ipos_table.currentRow()
-        if row >= 0:
-            self._ipos_table.removeRow(row)
-
-    def _collect_initial_positions(self) -> dict[str, tuple[int, float]] | None:
-        result = {}
-        for row in range(self._ipos_table.rowCount()):
-            sym_item = self._ipos_table.item(row, 0)
-            vol_item = self._ipos_table.item(row, 1)
-            price_item = self._ipos_table.item(row, 2)
-            if not sym_item:
-                continue
-            sym = sym_item.text().strip()
-            if not sym:
-                continue
-            try:
-                vol = int(vol_item.text().strip()) if vol_item else 0
-                price = (
-                    float(price_item.text().strip()) if price_item else 0.0
-                )
-            except ValueError:
-                continue
-            if vol > 0:
-                result[sym] = (vol, price)
-        return result if result else None
+    def _collect_init_pct(self) -> tuple[int, int]:
+        """返回 (pct_a, pct_b)。"""
+        return self._sp_init_pct_a.value(), self._sp_init_pct_b.value()
 
     # ════════════════════════════════════════════════
     #  参数收集
@@ -688,6 +719,9 @@ class LauncherWidget(QWidget):
             "cancel_priority": self._combo_cancel_priority.currentData(),
             "base_pct": self._sp_base_pct.value(),
             "high_pct": self._sp_high_pct.value(),
+            "min_order_ratio": self._sp_min_order_ratio.value(),
+            "open_wait_minutes": self._sp_open_wait.value(),
+            "enable_signal_check": self._cb_signal_check.isChecked(),
             "enable_t0": self._cb_strategy_t0.isChecked(),
         }
         return engine_params, strategy_params
@@ -701,7 +735,10 @@ class LauncherWidget(QWidget):
         if params is None:
             return
         engine_params, strategy_params = params
-        initial_positions = self._collect_initial_positions()
+        pct_a, pct_b = self._collect_init_pct()
+        if pct_a + pct_b > 100:
+            self._append_log("ERROR: A% + B% 不得超过 100%")
+            return
 
         self._btn_run.setEnabled(False)
         self._progress.setVisible(True)
@@ -709,7 +746,7 @@ class LauncherWidget(QWidget):
         self._append_log("准备启动回测...")
 
         self._worker = _BacktestWorker(
-            engine_params, strategy_params, initial_positions
+            engine_params, strategy_params, pct_a=pct_a, pct_b=pct_b
         )
         self._worker.log_signal.connect(self._append_log)
         self._worker.finished_signal.connect(self._on_finished)
@@ -753,16 +790,11 @@ class LauncherWidget(QWidget):
             return
         target = path or self._json_path
         engine_params, strategy_params = params
-        ipos = self._collect_initial_positions()
+        pct_a, pct_b = self._collect_init_pct()
         data = {
             "engine": engine_params,
             "strategy": strategy_params,
-            "initial_positions": {
-                sym: {"volume": v, "cost_price": p}
-                for sym, (v, p) in ipos.items()
-            }
-            if ipos
-            else {},
+            "initial_positions": {"pct_a": pct_a, "pct_b": pct_b},
         }
         target.write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -863,22 +895,21 @@ class LauncherWidget(QWidget):
             self._sp_base_pct.setValue(sp["base_pct"])
         if "high_pct" in sp:
             self._sp_high_pct.setValue(sp["high_pct"])
+        if "min_order_ratio" in sp:
+            self._sp_min_order_ratio.setValue(sp["min_order_ratio"])
+        if "open_wait_minutes" in sp:
+            self._sp_open_wait.setValue(sp["open_wait_minutes"])
+        if "enable_signal_check" in sp:
+            self._cb_signal_check.setChecked(sp["enable_signal_check"])
         if "enable_t0" in sp:
             self._cb_strategy_t0.setChecked(sp["enable_t0"])
 
-        # 初始仓位
+        # 初始持仓比例
         ipos_data = data.get("initial_positions", {})
-        self._ipos_table.setRowCount(0)
-        for sym, info in ipos_data.items():
-            row = self._ipos_table.rowCount()
-            self._ipos_table.insertRow(row)
-            self._ipos_table.setItem(row, 0, QTableWidgetItem(sym))
-            self._ipos_table.setItem(
-                row, 1, QTableWidgetItem(str(info.get("volume", 0)))
-            )
-            self._ipos_table.setItem(
-                row, 2, QTableWidgetItem(str(info.get("cost_price", 0.0)))
-            )
+        if "pct_a" in ipos_data:
+            self._sp_init_pct_a.setValue(ipos_data["pct_a"])
+        if "pct_b" in ipos_data:
+            self._sp_init_pct_b.setValue(ipos_data["pct_b"])
 
     def hideEvent(self, event):
         """窗口隐藏/关闭时自动保存。"""
